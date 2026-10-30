@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "uncensored": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Uncensored (Clore)",
+      "options": {
+        "baseURL": "http://HOST:PORT/v1",
+        "apiKey": "PUT_YOUR_API_KEY_HERE"
+      },
+      "models": {
+        "uncensored": {
+          "name": "Uncensored model on Clore.ai",
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "tool_call": true,
+          "reasoning": true
+        }
+      }
+    }
+  }
+}

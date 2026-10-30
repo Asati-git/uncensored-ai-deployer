@@ -1,0 +1,18 @@
+# Пресет сэмплинга для uncensored-моделей (TabbyAPI sampler_overrides/uncensored.yml).
+# Холодное сэмплирование: меньше срывов в другие языки и пустых ответов на длинном контексте.
+# Этот же набор зашит в templates/onstart_tabby.sh и в параметры llama.cpp/vLLM.
+temperature:
+  override: 0.7
+  force: true
+top_p:
+  override: 0.95
+  force: true
+min_p:
+  override: 0.02
+  force: true
+top_k:
+  override: 0
+  force: true
+repetition_penalty:
+  override: 1.0
+  force: true

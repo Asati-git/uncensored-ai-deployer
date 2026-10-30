@@ -1,0 +1,6 @@
+# Перевод строк: всё с LF. Иначе на Windows git превращает их в CRLF, и тогда bash
+# на macOS/Linux падает с «\r: command not found», а startup-скрипты, которые едут
+# на арендованный сервер, ломаются прямо внутри контейнера.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary

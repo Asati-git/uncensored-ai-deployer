@@ -1,0 +1,10 @@
+.env
+onstart.generated.sh
+__pycache__/
+*.pyc
+create*.json
+# состояние, а не код: чёрный список серверов у каждого свой
+blacklist.json
+# артефакты прогонов: в них попадают ключи из .env заказов
+_testruns/
+*.log

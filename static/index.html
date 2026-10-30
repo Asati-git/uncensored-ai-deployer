@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UncensoredAI — Clore.ai</title>
+<link rel="stylesheet" href="/style.css">
+<!-- выбранная тема из /themes.html; пустой файл = исходное оформление -->
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<!-- шапка и вкладки прилипают к верху одним блоком — иначе вкладки уезжают при прокрутке -->
+<div class="topbar">
+<header>
+  <div class="brand">
+    <h1>Uncensored<span>AI</span></h1>
+    <a class="tg" href="https://t.me/asati_shill" target="_blank" rel="noopener">ТГ канал автора</a>
+    <a class="tg" href="/themes.html" target="_blank">оформление</a>
+  </div>
+  <div class="head-right">
+    <span id="status-pill" class="pill">проверяю…</span>
+    <button id="btn-refresh" class="ghost" title="Обновить состояние">⟳</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="model">1 · Модель</button>
+  <button class="tab" data-tab="server">2 · Сервер</button>
+  <button class="tab" data-tab="deploy">3 · Деплой</button>
+  <button class="tab" data-tab="orders">Заказы</button>
+  <button class="tab" data-tab="settings">Настройки</button>
+</nav>
+</div>
+
+<!-- ───────── модель ───────── -->
+<section class="page active" id="page-model">
+  <div class="card">
+    <h2>Своя ссылка на Hugging Face</h2>
+    <p class="muted">Можно вставить полный URL репозитория или просто <code>owner/name</code>.
+      Формат весов определяется автоматически: GGUF → llama.cpp, safetensors/AWQ/GPTQ/FP8 → vLLM.</p>
+    <div class="row">
+      <input id="model-ref" type="text" placeholder="https://huggingface.co/owner/model-name  или  owner/model-name" spellcheck="false">
+      <input id="model-ctx" type="number" placeholder="контекст" min="2048" step="1024" title="Контекст; пусто — из конфига модели">
+      <button id="btn-pick" class="primary">Выбрать</button>
+    </div>
+    <div id="model-card" class="model-card hidden"></div>
+  </div>
+
+  <div class="card">
+    <h2>Актуальные uncensored-модели</h2>
+    <div class="segmented" id="periods">
+      <button data-period="uncensored" class="accent on" title="Модели, где цензуру сносили агрессивнее всего: дообучением или хирургией по весам">🔓 Модели без цензуры</button>
+      <button data-period="top" class="accent" title="Отобранные вручную расцензуренные модели для написания кода">★ Топ для кодинга</button>
+      <button data-period="all" title="Сортировка по скачиваниям за всё время (downloadsAllTime)">За всё время</button>
+      <button data-period="month" title="Счётчик Hugging Face за последние 30 дней">За месяц</button>
+      <button data-period="week" title="Тренд Hugging Face среди моделей, обновлённых за 7 дней">За неделю</button>
+      <button data-period="day" title="Тренд Hugging Face среди моделей, обновлённых за 2 дня">За день</button>
+      <button data-period="new" title="Самые свежие по дате обновления">Новые</button>
+    </div>
+    <div id="period-note" class="muted"></div>
+    <div class="row filters">
+      <input id="q" type="text" placeholder="свой поисковый запрос по HF (пусто = сводка uncensored)" spellcheck="false">
+      <select id="fmt">
+        <option value="">любой формат</option>
+        <option value="gguf">GGUF</option>
+        <option value="safetensors">safetensors</option>
+      </select>
+      <button id="btn-search" class="primary">Искать</button>
+    </div>
+    <ul class="hint">
+      <li><b>safetensors / vLLM</b> — больше нагрузка на железо, быстрее работает на большом контексте</li>
+      <li><b>GGUF</b>, квант Q4_K_M или Q5_K_M — если экономите или карта одна на 24 ГБ</li>
+    </ul>
+    <div id="models" class="list"></div>
+  </div>
+</section>
+
+<!-- ───────── сервер ───────── -->
+<section class="page" id="page-server">
+  <div class="card">
+    <h2>Подбор сервера на Clore.ai</h2>
+    <div id="need" class="muted">Сначала выберите модель — требования к VRAM и диску подставятся сами.</div>
+    <div class="row filters">
+      <label>Тип заказа<select id="order-type">
+        <option value="on-demand">on-demand</option>
+        <option value="spot">spot (дешевле, могут перебить)</option>
+      </select></label>
+      <label>VRAM ≥ ГиБ<input id="f-vram" type="number" step="1" min="0"></label>
+      <label>Диск ≥ ГБ<input id="f-disk" type="number" step="10" min="0"></label>
+      <label>Цена ≤ $/ч<input id="f-price" type="text" placeholder="пусто = любая"></label>
+      <label>Поиск<input id="f-gpu" type="text" placeholder="5090 · 2x 4090 · a100 · id 123073"
+        title="Слова ищутся в названии карт, их количестве и id сервера — все сразу"></label>
+      <label>Сеть ≥ Mbps<input id="f-net" type="number" step="100" min="0" value="200"></label>
+      <label class="check" title="Volta (V100), Turing, Pascal: vLLM и TabbyAPI на них не стартуют, llama.cpp работает медленно"><input id="f-old-gpu" type="checkbox"> показывать старые GPU</label>
+      <button id="btn-offers" class="primary">Найти серверы</button>
+    </div>
+    <p class="muted">Цены — в долларах за час. Clore выставляет их за сутки и списывает с баланса
+      в USDC, BTC или CLORE: валюта подбирается автоматически — та, что дешевле по курсу
+      и на которой есть средства.</p>
+    <p class="muted">Карты старее Ampere скрыты: дешёвые 8× Tesla V100 выглядят выгодно, но Volta
+      не умеет bfloat16 и FP8, а vLLM с версии V1 требует Ampere — заказ просто не поднимется.</p>
+    <div id="offers" class="list"></div>
+  </div>
+</section>
+
+<!-- ───────── деплой ───────── -->
+<section class="page" id="page-deploy">
+  <div class="card">
+    <h2>Развернуть</h2>
+    <div id="plan" class="plan"></div>
+    <div class="row filters">
+      <label>Docker-образ<input id="d-image" type="text" placeholder="по умолчанию — под движок"></label>
+      <label>SSH-пароль<input id="d-ssh" type="text" placeholder="по умолчанию — из ключа API"></label>
+      <label class="check"><input id="d-force" type="checkbox"> арендовать ещё один сервер</label>
+    </div>
+    <div class="row">
+      <button id="btn-dry" class="ghost">Проверить без аренды</button>
+      <button id="btn-deploy" class="primary big">Арендовать и развернуть</button>
+    </div>
+    <p class="muted">Clore списывает оплату с баланса по часам. Веса живут в контейнере:
+      отмена заказа освобождает сервер и удаляет модель — следующий деплой качает её заново.</p>
+  </div>
+
+  <div class="card">
+    <h2>Текущий сервер</h2>
+    <div id="current"></div>
+    <div class="row">
+      <button id="btn-bench" class="ghost">Замерить скорость</button>
+      <button id="btn-cancel" class="danger">Отменить заказ</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Лог <span id="job-elapsed" class="muted"></span></h2>
+    <pre id="job-log" class="log">— ещё не запускалось —</pre>
+  </div>
+</section>
+
+<!-- ───────── заказы ───────── -->
+<section class="page" id="page-orders">
+  <div class="card">
+    <h2>Мои заказы Clore <button id="btn-orders" class="ghost">⟳ обновить</button></h2>
+    <div id="orders" class="list"></div>
+  </div>
+  <div class="card">
+    <h2>Кошельки <button id="btn-wallets" class="ghost">⟳ обновить</button></h2>
+    <div id="wallets" class="list"></div>
+  </div>
+</section>
+
+<!-- ───────── настройки ───────── -->
+<section class="page" id="page-settings">
+  <div class="card">
+    <h2>Ключи</h2>
+    <p class="muted">Сохраняются в локальный <code>.env</code> рядом с проектом и наружу не отправляются
+      (UI слушает только 127.0.0.1).</p>
+    <div class="fields">
+      <label>API-ключ Clore.ai <span class="muted">— кабинет clore.ai → Settings → API</span>
+        <input id="s-CLORE_API_KEY" type="password" placeholder="оставьте пустым, чтобы не менять">
+      </label>
+      <label>Ключ вашего API <span class="muted">— пароль к развёрнутой модели, придумайте любой</span>
+        <span class="row"><input id="s-API_KEY" type="password" placeholder="оставьте пустым, чтобы не менять">
+        <button id="btn-genkey" class="ghost">сгенерировать</button></span>
+      </label>
+      <label>Hugging Face токен (read) <span class="muted">— нужен для gated-репозиториев</span>
+        <input id="s-HF_TOKEN" type="password" placeholder="hf_…">
+      </label>
+      <label>Telegram bot token <span class="muted">— необязательно, отчёты о деплое</span>
+        <input id="s-TG_BOT_TOKEN" type="password" placeholder="123456:AA…">
+      </label>
+      <label>Telegram chat id
+        <input id="s-TG_CHAT_ID" type="text" placeholder="123456789">
+      </label>
+      <label>Не брать серверы <span class="muted">— подстроки имени хоста через запятую.
+        Clore не сообщает страну до аренды, поэтому такой заказ создаётся и сразу отменяется,
+        а деплой идёт к следующему кандидату</span>
+        <input id="s-EXCLUDE_HOSTS" type="text" placeholder=".ru, msk">
+      </label>
+    </div>
+    <div class="row">
+      <button id="btn-save" class="primary">Сохранить</button>
+      <span id="save-note" class="muted"></span>
+    </div>
+  </div>
+</section>
+
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

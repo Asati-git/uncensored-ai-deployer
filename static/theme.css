@@ -1,0 +1,18 @@
+/* Высокий контраст · Красный */
+:root{
+  --bg:#121212; --panel:#1c1c1c; --panel-2:#262626; --line:#474040;
+  --text:#eee7e7; --muted:#aa9292;
+  --accent:#fa4c4c; --accent-2:#bd0505;
+  --ok:#53c679; --warn:#dfa849;
+  /* акцент тут красный, поэтому ошибки отводим в светлый лосось: чистый красный
+     на красном фоне кнопок переставал читаться как «что-то не так» */
+  --bad:#ff9a8a;
+  --on-accent:#ffffff;
+}
+body{font-family:"Segoe UI", Inter, system-ui, sans-serif;}
+.card,.item,.model-card{border-radius:6px; box-shadow:none;}
+button,input,select,.pill,.badge{border-radius:6px;}
+button.primary{background:var(--accent-2); border-color:var(--accent-2); color:#fff;}
+button.primary:hover{background:var(--accent);}
+/* в теме «высокий контраст» граница — единственный разделитель, тень отключена */
+.card,.item{border-width:1px;}
