@@ -934,6 +934,33 @@ def _pick_gguf(options):
     return options[-1] if options else None
 
 
+# Сколько шагов по цепочке base_model готовы пройти. Одного не хватает: у квантователей
+# принято ссылаться на другой GGUF-репозиторий, а тот уже на исходную модель. Пока шагов
+# было один, у таких сборок не считались ни KV-кэш, ни доля экспертов — например,
+# SC117 -> ISTA-DASLab -> Qwen/Qwen3.8-Flash-Next.
+_BASE_HOPS = 3
+
+
+def _config_with_base(repo_id, meta, own_cfg, token=None):
+    """Конфиг с полями архитектуры: свой, а если его нет — у предка по base_model."""
+    if own_cfg.get("num_hidden_layers"):
+        return own_cfg
+    seen, card = {repo_id}, meta
+    for _ in range(_BASE_HOPS):
+        base = _base_repo(card)
+        if not base or base in seen:
+            break
+        seen.add(base)
+        cfg = _raw_config(base, token)
+        if cfg.get("num_hidden_layers"):
+            return cfg
+        try:
+            card = _get(f"models/{base}", token)
+        except RuntimeError:
+            break
+    return own_cfg
+
+
 def model_info(ref, ctx=None, token=None):
     """Полная карточка модели: формат, движок, размер весов, оценка нужных VRAM и диска."""
     repo_id = normalize_ref(ref)
@@ -950,11 +977,7 @@ def model_info(ref, ctx=None, token=None):
     # KV-кэш считаем по конфигу модели: у GGUF-репозитория своего конфига нет,
     # поэтому берём его у исходной модели, указанной в карточке как base_model
     own_cfg = _raw_config(repo_id, token)   # собственный конфиг: из него берём квантование
-    cfg = own_cfg
-    if not cfg.get("num_hidden_layers"):
-        base = _base_repo(meta)
-        if base:
-            cfg = _raw_config(base, token) or cfg
+    cfg = _config_with_base(repo_id, meta, own_cfg, token)
     kv_gib = kv_cache_gib(cfg, ctx, engine)
     kv_known = kv_gib is not None
 
