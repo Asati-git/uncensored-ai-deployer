@@ -267,7 +267,7 @@ async function pickModel() {
     state.gguf_file = model.gguf_file || '';
     state.offer = null;
     renderModelCard(model);
-    $('f-vram').value = Math.ceil(model.vram_gib);
+    applyNeed();
     $('f-disk').value = model.disk_gb;
     $('model-ctx').value = model.ctx;
     renderPlan();
@@ -304,11 +304,15 @@ function quantSelect(m) {
 function applyQuant(o) {
   if (!o || !state.model) return;
   state.gguf_file = o.path;
-  state.model = { ...state.model, weights_gib: o.weights_gib, vram_gib: o.vram_gib, disk_gb: o.disk_gb };
-  $('f-vram').value = Math.ceil(o.vram_gib);
+  state.model = { ...state.model, weights_gib: o.weights_gib, vram_gib: o.vram_gib, disk_gb: o.disk_gb,
+    vram_cpu_moe_gib: o.vram_cpu_moe_gib ?? state.model.vram_cpu_moe_gib,
+    ram_gb: o.ram_gb ?? state.model.ram_gb };
+  applyNeed();
   $('f-disk').value = o.disk_gb;
   if ($('kv-weights')) $('kv-weights').textContent = `${o.weights_gib} GiB`;
   if ($('kv-vram')) $('kv-vram').textContent = `≈ ${o.vram_gib} GiB`;
+  if ($('kv-vram-moe') && o.vram_cpu_moe_gib) $('kv-vram-moe').textContent = `≈ ${o.vram_cpu_moe_gib} GiB`;
+  if ($('kv-ram') && o.ram_gb) $('kv-ram').textContent = `${o.ram_gb} GB`;
   if ($('kv-disk')) $('kv-disk').textContent = `${o.disk_gb} GB`;
   // селекты в карточке и в списке должны показывать одно и то же
   document.querySelectorAll('.quant select').forEach((s) => { s.value = o.path; });
@@ -334,6 +338,9 @@ function renderModelCard(m) {
       <div class="kv"><b>${esc(engines[m.engine] || m.engine)}</b><span>движок</span></div>
       <div class="kv"><b id="kv-weights">${m.weights_gib} GiB</b><span>веса (скачать)</span></div>
       <div class="kv"><b id="kv-vram">≈ ${m.vram_gib} GiB</b><span>нужно VRAM</span></div>
+      ${m.cpu_moe ? `<div class="kv"><b id="kv-vram-moe">≈ ${m.vram_cpu_moe_gib} GiB</b>
+        <span>VRAM с экспертами в RAM</span></div>
+      <div class="kv"><b id="kv-ram">${m.ram_gb} GB</b><span>нужно RAM для этого</span></div>` : ''}
       <div class="kv"><b>${m.kv_gib} GiB</b><span>KV-кэш${m.kv_known ? '' : ' (оценка)'}</span></div>
       <div class="kv"><b id="kv-disk">${m.disk_gb} GB</b><span>нужно диска</span></div>
       <div class="kv"><b>${fmtCtx(m.ctx)}</b><span>контекст</span></div>
@@ -342,7 +349,13 @@ function renderModelCard(m) {
     <div class="quant-slot"></div>
     <p class="muted" style="margin:10px 0 0">VRAM = веса + KV-кэш под выбранный контекст + ~${Math.min(8, 1.5 + m.weights_gib * 0.02).toFixed(1)} GiB на буферы движка.
       ${m.kv_known ? 'KV посчитан по конфигу модели' : 'Конфиг модели недоступен — KV прикинут по числу параметров'};
-      у llama.cpp кэш в q8_0, у vLLM в fp16.</p>`;
+      у llama.cpp кэш в q8_0, у vLLM в fp16.</p>
+    ${m.cpu_moe ? `<p class="muted" style="margin:6px 0 0">Это MoE: ${m.moe.experts} экспертов,
+      на токен работают ${m.moe.active}. Поэтому их можно держать в обычной оперативке и считать
+      на CPU: карта нужна в разы скромнее. Но и скорость падает в разы — на одной и той же
+      RTX 3090 замерено 155 ток/с против 24 при полной выгрузке. Это способ поднять модель,
+      которая иначе не влезает вообще, а не способ сэкономить на той, что влезает.
+      Включается галочкой на вкладке «Сервер».</p>` : ''}`;
 
   const sel = quantSelect(m);
   if (sel) $('model-card').querySelector('.quant-slot').appendChild(sel);
@@ -455,6 +468,26 @@ function renderOffers() {
   }
 }
 
+// Выгрузка экспертов в оперативку доступна только у MoE-моделей на llama.cpp.
+// Галочка меняет и требование к карте, и требование к объёму RAM сервера.
+function cpuMoeOn() {
+  const box = $('f-cpu-moe');
+  return Boolean(box && box.checked && state.model?.cpu_moe);
+}
+
+function applyNeed() {
+  const m = state.model;
+  if (!m) return;
+  const box = $('f-cpu-moe');
+  if (box) {
+    box.closest('label').style.display = m.cpu_moe ? '' : 'none';
+    if (!m.cpu_moe) box.checked = false;
+  }
+  $('f-vram').value = Math.ceil(cpuMoeOn() ? m.vram_cpu_moe_gib : m.vram_gib);
+  $('f-ram').value = cpuMoeOn() ? m.ram_gb : '';
+  renderPlan();
+}
+
 async function loadOffers() {
   const box = $('offers');
   box.innerHTML = '<p class="muted">запрашиваю маркетплейс Clore…</p>';
@@ -465,7 +498,7 @@ async function loadOffers() {
     const q = new URLSearchParams({
       vram: $('f-vram').value || '0', disk: $('f-disk').value || '0',
       type: $('order-type').value,
-      min_net: $('f-net').value || '0',
+      min_net: $('f-net').value || '0', ram: $('f-ram').value || '0',
       weights: String(state.model?.weights_gib || 0), limit: String(OFFERS_POOL),
       // без модели движок неизвестен — тогда показываем всё, включая старые карты
       engine: state.model?.engine || '', quant: state.model?.precision || '',
@@ -507,6 +540,7 @@ async function startDeploy(dryRun) {
       image: $('d-image').value.trim(),
       ssh_password: $('d-ssh').value.trim(),
       gguf_file: state.gguf_file || '',
+      cpu_moe: cpuMoeOn(),
       force: $('d-force').checked,
       dry_run: !!dryRun,
     });
@@ -634,6 +668,7 @@ document.querySelectorAll('#periods button').forEach((b) => {
   };
 });
 $('btn-offers').onclick = loadOffers;
+$('f-cpu-moe').onchange = () => { applyNeed(); loadOffers(); };
 // Фильтр применяется к уже загруженному списку — поэтому мгновенно и без запроса к Clore
 $('f-gpu').oninput = () => { if (state.offersData) renderOffers(); };
 $('f-gpu').onkeydown = (e) => { if (e.key === 'Enter') loadOffers(); };

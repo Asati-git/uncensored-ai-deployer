@@ -700,6 +700,133 @@ def _quant_bpw(label):
     return best
 
 
+# ---------- MoE и выгрузка экспертов в оперативку ----------
+# У MoE-модели почти весь вес — это эксперты, а на каждый токен работает лишь малая их
+# часть. Поэтому их можно держать в обычной оперативке и считать на CPU: llama.cpp умеет
+# это флагом --n-cpu-moe. Платим процентами скорости, а экономим в разы на VRAM —
+# модель, под которую нужно четыре карты, влезает в одну плюс много RAM.
+_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
+_TOPK_KEYS = ("num_experts_per_tok", "num_experts_per_token", "moe_topk", "top_k")
+_SHARED_KEYS = ("n_shared_experts", "num_shared_experts", "moe_num_shared_experts")
+
+
+def _first(cfg, keys, default=0):
+    for k in keys:
+        v = cfg.get(k)
+        if v:
+            return int(v)
+    return default
+
+
+def _moe_layers(cfg, layers):
+    """Сколько слоёв реально содержат экспертов: часть архитектур чередует их с плотными."""
+    dense_head = int(cfg.get("first_k_dense_replace") or 0)      # DeepSeek: первые слои плотные
+    n = max(layers - dense_head, 0)
+    only = cfg.get("mlp_only_layers")
+    if isinstance(only, list):
+        n = max(n - len(only), 0)
+    step = int(cfg.get("decoder_sparse_step") or 1)              # Qwen: MoE через каждые step
+    if step > 1:
+        n = n // step
+    return n
+
+
+def moe_profile(cfg):
+    """
+    Доля веса, которую занимают маршрутизируемые эксперты, и сколько слоёв их содержат.
+    Считаем по конфигу в параметрах, а потом переносим долю на реальный размер файла —
+    так оценка не зависит от того, в каком кванте скачан репозиторий.
+    None — модель не MoE либо конфига не хватает.
+    """
+    experts = _first(cfg, _EXPERT_KEYS)
+    layers = int(cfg.get("num_hidden_layers") or cfg.get("n_layer") or 0)
+    hidden = int(cfg.get("hidden_size") or cfg.get("n_embd") or 0)
+    if experts < 2 or not layers or not hidden:
+        return None
+    moe_inter = int(cfg.get("moe_intermediate_size") or cfg.get("intermediate_size") or 0)
+    dense_inter = int(cfg.get("intermediate_size") or moe_inter or 0)
+    if not moe_inter:
+        return None
+    moe_layers = _moe_layers(cfg, layers) or layers
+    dense_layers = max(layers - moe_layers, 0)
+    shared = _first(cfg, _SHARED_KEYS)
+
+    # SwiGLU: три матрицы на эксперта (gate, up, down)
+    per_expert = 3 * hidden * moe_inter
+    routed = moe_layers * experts * per_expert          # это и уедет в оперативку
+    rest = moe_layers * shared * per_expert + dense_layers * 3 * hidden * dense_inter
+
+    heads = int(cfg.get("num_attention_heads") or cfg.get("n_head") or 0)
+    kv_heads = int(cfg.get("num_key_value_heads") or heads or 0)
+    head_dim = int(cfg.get("head_dim") or (hidden // heads if heads else 0))
+    if heads and head_dim:
+        attn = layers * (2 * hidden * heads * head_dim + 2 * hidden * kv_heads * head_dim)
+    else:
+        attn = layers * 4 * hidden * hidden              # грубо, если конфиг нестандартный
+    vocab = int(cfg.get("vocab_size") or 0)
+    emb = vocab * hidden * (1 if cfg.get("tie_word_embeddings") else 2)
+
+    total = routed + rest + attn + emb
+    if total <= 0:
+        return None
+    return {
+        "experts": experts,
+        "active": _first(cfg, _TOPK_KEYS),
+        "moe_layers": moe_layers,
+        "expert_share": round(routed / total, 3),        # какая доля весов — эксперты
+    }
+
+
+def cpu_moe_estimate(moe, weights_gib, kv_gib):
+    """
+    Во что обходится полная выгрузка экспертов: сколько останется на карте и сколько
+    понадобится оперативки. Отдельно — вес экспертов одного слоя: по нему считается,
+    сколько слоёв выгружать, если карта чуть-чуть не вмещает модель целиком.
+    """
+    if not moe or not weights_gib:
+        return None
+    expert_gib = weights_gib * moe["expert_share"]
+    on_gpu = max(weights_gib - expert_gib, 0.2)
+    return {
+        "vram_gib": vram_estimate(round(on_gpu, 1), kv_gib),
+        # оперативка: сами эксперты + запас на загрузчик и страничный кэш
+        "ram_gb": int(expert_gib * 1.2 + 6),
+        "per_layer_gib": round(expert_gib / max(moe["moe_layers"], 1), 3),
+        "max_layers": moe["moe_layers"],
+    }
+
+
+def cpu_moe_layers(moe_info, need_vram_gib, have_vram_gib, card_gib=None):
+    """
+    Сколько слоёв экспертов отправить в оперативку, чтобы модель влезла в карту.
+    Выгружаем минимум необходимого: каждый выгруженный слой — это работа для CPU.
+
+    card_gib — объём ОДНОЙ карты. Он важнее суммарного: llama.cpp режет модель по слоям,
+    и все слои, чьи эксперты остались на GPU, оказываются подряд — то есть целиком на
+    одной карте. Проверено на живом сервере: 2x8 ГиБ, двенадцать слоёв на GPU, попытка
+    выделить 12.2 ГиБ на одном устройстве и падение «unable to allocate CUDA1 buffer».
+    """
+    if not moe_info:
+        return 0
+    per = moe_info["per_layer_gib"]
+    total = moe_info["max_layers"]
+    if per <= 0:
+        return total if need_vram_gib > have_vram_gib else 0
+
+    by_total = 0
+    if need_vram_gib > have_vram_gib:
+        # небольшой запас: оценка VRAM не идеальна, а падение по OOM стоит часа ожидания
+        by_total = min(total, int((need_vram_gib - have_vram_gib + 1.0) / per) + 1)
+
+    by_card = 0
+    if card_gib:
+        # на той же карте живут внимание и KV-кэш, поэтому экспертам отдаём не всё
+        fits = int(max(card_gib * 0.8, 0) / per)
+        by_card = max(0, total - fits)
+
+    return max(0, min(total, max(by_total, by_card)))
+
+
 def vram_estimate(weights_gib, kv_gib):
     """
     Сколько VRAM нужно под веса. Накладные расходы движка (графы, буферы вычислений,
@@ -710,10 +837,12 @@ def vram_estimate(weights_gib, kv_gib):
     return round(weights_gib + kv_gib + overhead, 1)
 
 
-def _gguf_options(entries, ctx, kv_gib):
+def _gguf_options(entries, ctx, kv_gib, moe=None):
     """
     Группирует GGUF-файлы по квантам (шарды одного кванта — в одну запись)
     и считает для каждого размер и оценку VRAM/диска. Служебные файлы отбрасываются.
+    moe — профиль модели из moe_profile(): с ним у каждого кванта появляется вторая
+    оценка, «сколько нужно, если эксперты уедут в оперативку».
     """
     groups = {}
     for e in entries:
@@ -736,12 +865,17 @@ def _gguf_options(entries, ctx, kv_gib):
         weights = round(g["bytes"] / GIB, 1)
         # имя без .gguf; подпапку оставляем — в репозиториях бывают одноимённые файлы
         name = key[:-5] if key.lower().endswith(".gguf") else key
-        out.append({
+        opt = {
             "path": g["path"], "label": name, "parts": g["parts"],
             "weights_gib": weights, "bpw": _quant_bpw(name),
             "vram_gib": vram_estimate(weights, kv_gib),
             "disk_gb": int(weights * 1.15 + 20),
-        })
+        }
+        off = cpu_moe_estimate(moe, weights, kv_gib)
+        if off:
+            opt["vram_cpu_moe_gib"] = off["vram_gib"]
+            opt["ram_gb"] = off["ram_gb"]
+        out.append(opt)
     out.sort(key=lambda o: o["weights_gib"])
     return out
 
@@ -825,7 +959,9 @@ def model_info(ref, ctx=None, token=None):
     kv_known = kv_gib is not None
 
     # GGUF-репозиторий — это набор квантов; рабочий вес задаёт выбранный, а не весь репозиторий
-    all_options = _gguf_options(entries, ctx, kv_gib if kv_known else 0.0) if fmt == "gguf" else []
+    moe = moe_profile(cfg)
+    all_options = (_gguf_options(entries, ctx, kv_gib if kv_known else 0.0, moe)
+                   if fmt == "gguf" else [])
     options, low_only = _usable_quants(all_options)
     low_only = low_only and bool(all_options)  # у не-GGUF репозиториев квантов нет вовсе
     dropped = len(all_options) - len(options)
@@ -841,6 +977,9 @@ def model_info(ref, ctx=None, token=None):
         kv_gib = round(max(0.5, params * 0.25 * (ctx / 32768)
                            * KV_BYTES.get(engine, 2) / 2), 1)
     vram_gib = vram_estimate(weights_gib, kv_gib) if weights_gib else 0.0
+    # вторая оценка: эксперты в оперативке. Нужна и UI (показать выгоду), и подбору
+    # сервера (одна карта вместо четырёх), и деплою (сколько слоёв выгружать)
+    offload = cpu_moe_estimate(moe, weights_gib, kv_gib)
     # диск: веса + распакованный кэш загрузчика и система
     disk_gb = int(weights_gib * 1.15 + 20) if weights_gib else 60
 
@@ -868,6 +1007,10 @@ def model_info(ref, ctx=None, token=None):
         "gguf_low_only": low_only,                      # годных нет вообще — показываем как есть
         "ctx": ctx,
         "vram_gib": vram_gib,
+        "moe": moe,                                     # эксперты: сколько их и какая доля веса
+        "cpu_moe": offload,                             # во что обойдётся выгрузка в RAM
+        "vram_cpu_moe_gib": offload["vram_gib"] if offload else None,
+        "ram_gb": offload["ram_gb"] if offload else None,
         "kv_gib": kv_gib,
         "kv_known": kv_known,   # посчитан по конфигу, а не прикинут по размеру весов
         "disk_gb": disk_gb,

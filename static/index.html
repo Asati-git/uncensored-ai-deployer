@@ -92,6 +92,8 @@
       <label>Поиск<input id="f-gpu" type="text" placeholder="5090 · 2x 4090 · a100 · id 123073"
         title="Слова ищутся в названии карт, их количестве и id сервера — все сразу"></label>
       <label>Сеть ≥ Mbps<input id="f-net" type="number" step="100" min="0" value="200"></label>
+      <label>RAM ≥ GB<input id="f-ram" type="number" step="8" min="0" placeholder="пусто = любая"></label>
+      <label class="check" title="Только для MoE-моделей на llama.cpp: эксперты лежат в обычной оперативке и считаются на CPU. Карта нужна в разы скромнее, но и скорость падает в разы — замерено 155 ток/с против 24 на одной и той же RTX 3090. Берите, когда модель иначе не влезает вообще"><input id="f-cpu-moe" type="checkbox"> эксперты в RAM (дешевле сервер)</label>
       <label class="check" title="Volta (V100), Turing, Pascal: vLLM и TabbyAPI на них не стартуют, llama.cpp работает медленно"><input id="f-old-gpu" type="checkbox"> показывать старые GPU</label>
       <button id="btn-offers" class="primary">Найти серверы</button>
     </div>

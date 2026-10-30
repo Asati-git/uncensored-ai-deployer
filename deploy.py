@@ -260,6 +260,9 @@ def render_onstart(info, env, ctx=None, gguf_file=None, save=True):
         "__QUANT__": info.get("quantization") or "",
         "__TOOL_PARSER__": info.get("tool_parser") or "hermes",
         "__GGUF_FILE__": gguf,
+        # значение по умолчанию: реальное приедет в env заказа,
+        # когда станет известна VRAM выбранного сервера
+        "__N_CPU_MOE__": "0",
     }
     body = tpl
     for k, v in repl.items():
@@ -486,7 +489,7 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
                 gpu_filter=None, order_type="on-demand", min_net=MIN_NET_DOWN_MBPS,
                 download_gib=0, limit=25, engine=None, quant=None, allow_old_gpu=False,
                 balance_usd=None, min_reliability=MIN_RELIABILITY, spread=False,
-                hidden=None, blacklist=None):
+                hidden=None, blacklist=None, need_ram=0, cpu_moe=False):
     """
     Серверы, которые вместят модель, отсортированные по цене в USD с учётом времени скачивания.
     engine/quant — чтобы отсеять карты, на которых выбранный движок не заведётся
@@ -497,6 +500,12 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
     молча прятал две трети маркетплейса: с $10 на балансе не показывалось ничего дороже
     $0.41/ч, хотя заказ за $1/ч создаётся без проблем. Теперь отсеиваем только то,
     на что не хватает даже на час, а остальным считаем, насколько хватит денег.
+    cpu_moe — режим «эксперты в оперативке»: тогда скорость определяется не картой,
+    а пропускной способностью RAM, и в сортировке сервер с восемью каналами памяти
+    выигрывает у вдвое более дешёвого двухканального.
+    need_ram — сколько нужно обычной оперативки. Нужен для выгрузки экспертов MoE в RAM:
+    модель, под которую иначе требуется четыре карты, влезает в одну, но упирается уже
+    не в VRAM, а в объём RAM сервера.
     blacklist — id серверов, которые уже показали себя плохо (не поднялись или качали
     вдесятеро медленнее заявленного). По умолчанию берётся сохранённый список с диска.
     hidden — необязательный словарь: туда складывается, сколько серверов отсеял каждый
@@ -539,6 +548,9 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
             need *= VLLM_UNEVEN_HEADROOM
         if need and b["vram_gb"] < need:
             bump("мало VRAM")
+            continue
+        if need_ram and b["ram_gb"] and b["ram_gb"] < need_ram:
+            bump("мало оперативки")
             continue
         if need_disk and disk_gb(s) and disk_gb(s) < need_disk:
             bump("мало места на диске")
@@ -590,7 +602,11 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
         dl_hours = (download_gib * 1024 * 8 / max(net_est, 1)) / 3600 if download_gib else 0
         b["download_hours"] = round(dl_hours, 2)
         b["hours_affordable"] = round(balance_usd / price, 1) if balance_usd else None
-        b["score"] = price * (1 + dl_hours)
+        # При выгрузке экспертов генерация упирается в память: двухканальный сервер
+        # выдаст вдвое меньше токенов, чем четырёхканальный, и дешевизна его не спасает.
+        # Приводим цену к «за токен»: четыре канала считаем единицей отсчёта.
+        ram_factor = 4.0 / max(b.get("ram_channels") or 2, 1) if cpu_moe else 1.0
+        b["score"] = price * (1 + dl_hours) * ram_factor
         out.append(b)
     out.sort(key=lambda x: x["score"])
     if out:
@@ -805,8 +821,12 @@ def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT):
     что контейнер не стартовал — такой сервер лучше сразу отдать обратно, чем ждать час,
     платя за него и не имея возможности даже посмотреть логи.
     """
-    t0 = time.time()
+    t0, noted = time.time(), 0
     while time.time() - t0 < limit:
+        el = int(time.time() - t0)
+        if el - noted >= 60:      # иначе первые пять минут деплой выглядит зависшим
+            logf(f"жду отклика контейнера… {el // 60} мин из {limit // 60}")
+            noted = el
         if http_progress(host, ports.get(STATUS_PORT), timeout=5):
             return "статус-порт"
         if ssh_alive(host, ports.get(22, 22), timeout=5):
@@ -1072,12 +1092,26 @@ def deploy(cfg, env=None, logf=log):
     logf("баланс Clore: " + (", ".join(f"{amount:g} {cur}" for cur, amount in balances.items() if amount)
                              or "пусто") + f" (≈ ${bal_usd:.2f})")
 
-    offers = find_offers(clore, info["vram_gib"], info["disk_gb"], cfg.get("max_price_usd"),
+    # Выгрузка экспертов в оперативку: работает только у llama.cpp и только для MoE.
+    # Требование к карте падает в разы, зато появляется требование к объёму RAM.
+    offload = info.get("cpu_moe") if info["engine"] == hfmodels.ENGINE_LLAMACPP else None
+    cpu_moe = bool(cfg.get("cpu_moe")) and bool(offload)
+    need_vram, need_ram = info["vram_gib"], 0
+    if cpu_moe:
+        need_vram, need_ram = offload["vram_gib"], offload["ram_gb"]
+        logf(f"эксперты можно держать в оперативке: VRAM {info['vram_gib']} -> "
+             f"{need_vram} GiB, зато нужно {need_ram} GB RAM "
+             f"({info['moe']['experts']} экспертов, активны {info['moe']['active']})")
+    elif cfg.get("cpu_moe"):
+        logf("выгрузка экспертов не применима: нужна MoE-модель в GGUF (движок llama.cpp)")
+
+    offers = find_offers(clore, need_vram, info["disk_gb"], cfg.get("max_price_usd"),
                          forced_currency, cfg.get("gpu_filter"), order_type,
                          download_gib=info["weights_gib"],
                          engine=info["engine"], quant=info.get("precision"),
                          allow_old_gpu=bool(cfg.get("allow_old_gpu")),
-                         balance_usd=bal_usd or None, spread=bool(cfg.get("spread")))
+                         balance_usd=bal_usd or None, spread=bool(cfg.get("spread")),
+                         need_ram=need_ram, cpu_moe=cpu_moe)
     if cfg.get("server_id"):
         sid = int(cfg["server_id"])
         offers = [o for o in offers if int(o["id"]) == sid] or \
@@ -1135,6 +1169,17 @@ def deploy(cfg, env=None, logf=log):
             logf(f"сервер {sid}: принимает только {currency}, а на этом кошельке пусто — "
                  f"беру следующий")
             continue
+        # Выгружаем минимум необходимого: каждый слой в оперативке — это работа для CPU.
+        # На большой карте выгрузка может не понадобиться вовсе, даже если включена.
+        card_gib = offer["vram_gb"] / max(offer["gpu_count"], 1)
+        n_cpu_moe = (hfmodels.cpu_moe_layers(offload, info["vram_gib"], offer["vram_gb"],
+                                             card_gib=card_gib) if cpu_moe else 0)
+        order_env["N_CPU_MOE"] = str(n_cpu_moe)
+        if n_cpu_moe:
+            logf(f"эксперты {n_cpu_moe} слоёв из {offload['max_layers']} уедут в оперативку "
+                 f"({offer['vram_gb']} GiB VRAM против {info['vram_gib']} нужных)")
+        elif cpu_moe:
+            logf(f"карта вмещает модель целиком — выгрузка не нужна")
         logf(f"арендую сервер {sid} ({offer['gpu_count']}x {offer['gpu']}) за ${usd:.3f}/ч "
              f"(списание {amount:g} {currency}/сутки)")
         # Запоминаем, какие заказы на этом сервере уже есть: иначе чужой (или свой прошлый)
@@ -1249,6 +1294,11 @@ def deploy(cfg, env=None, logf=log):
             return {"status": "timeout", "order": oid, "api_url": api_url, "ssh": ssh}
 
         speed = bench(api_url, api_key)
+        if n_cpu_moe:
+            # С экспертами в оперативке первый замер нечестно низкий: файл ещё не весь
+            # в страничном кэше, и часть экспертов читается с диска. Замерено на живом
+            # сервере: 8 ток/с сразу после старта против 19 через минуту прогрева.
+            speed = max(speed or 0, bench(api_url, api_key) or 0) or None
         # при пакетных прогонах переключать OpenCode на каждую проверяемую модель незачем
         if not cfg.get("skip_opencode"):
             update_opencode(api_url, api_key, info["repo_id"].split("/")[-1], logf,
@@ -1312,6 +1362,9 @@ def main():
     ap.add_argument("--spread", action="store_true",
                     help="брать случайный сервер из близких по цене, а не всегда самый "
                          "дешёвый — нужно, когда деплоев несколько одновременно")
+    ap.add_argument("--cpu-moe", action="store_true",
+                    help="у MoE-модели держать экспертов в оперативке (llama.cpp): "
+                         "карта нужна в разы скромнее, скорость ниже на проценты")
     ap.add_argument("--force", action="store_true", help="арендовать ещё один сервер")
     ap.add_argument("--dry-run", action="store_true", help="только показать кандидатов")
     args = ap.parse_args()
@@ -1324,6 +1377,7 @@ def main():
                   "server_id": args.server, "gpu_filter": args.gpu, "image": args.image,
                   "gguf_file": args.gguf_file, "skip_opencode": args.no_opencode,
                   "allow_old_gpu": args.allow_old_gpu, "spread": args.spread,
+                  "cpu_moe": args.cpu_moe,
                   "exclude_hosts": args.exclude_hosts,
                   "force": args.force, "dry_run": args.dry_run}, env)
     return 0 if res.get("status") in ("ready", "already-running", "dry-run") else 1

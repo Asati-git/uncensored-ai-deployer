@@ -12,6 +12,9 @@ MODEL_NAME="${MODEL_NAME:-__MODEL_NAME__}"
 API_KEY="${API_KEY:-__API_KEY__}"
 CTX="${CTX:-__CTX__}"
 GGUF_FILE="${GGUF_FILE:-__GGUF_FILE__}"
+# Сколько слоёв MoE-экспертов оставить в оперативке. Считается в deploy.py под VRAM
+# конкретного сервера и приезжает в env заказа; 0 — вся модель на карте.
+N_CPU_MOE="${N_CPU_MOE:-__N_CPU_MOE__}"
 PORT="__PORT__"
 MODEL_DIR="/root/models/${MODEL_NAME}"
 
@@ -80,6 +83,23 @@ if [ -z "${GGUF_FILE}" ] || [ ! -f "${GGUF}" ]; then
   echo "[setup] выбранный файл не найден, беру ${GGUF}"
 fi
 [ -n "${GGUF}" ] && [ -f "${GGUF}" ] || { echo "[setup] ОШИБКА: не нашёл ни одного .gguf в ${MODEL_DIR}"; exit 1; }
+# У MoE-модели на каждый токен работает лишь малая часть экспертов, поэтому их можно
+# держать в обычной RAM и считать на CPU. Замерено на RTX 3090: 155 ток/с против 24 при
+# полной выгрузке — это способ поднять модель, которая иначе не влезает, а не ускорение.
+# Флаг --n-cpu-moe есть не во всех сборках, поэтому для старых остаётся запасной путь
+# через --override-tensor с явным перечислением слоёв.
+MOE_ARG=""
+if [ -n "${N_CPU_MOE}" ] && [ "${N_CPU_MOE}" -gt 0 ] 2>/dev/null; then
+  if /root/llama.cpp/build/bin/llama-server --help 2>&1 | grep -q -- "--n-cpu-moe"; then
+    MOE_ARG="--n-cpu-moe ${N_CPU_MOE}"
+  else
+    LAYERS=$(seq 0 $((N_CPU_MOE - 1)) | paste -sd'|')
+    MOE_ARG="--override-tensor blk\.(${LAYERS})\.ffn_(up|down|gate)_exps\.weight=CPU"
+    echo "[setup] эта сборка не знает --n-cpu-moe, беру --override-tensor"
+  fi
+  echo "[setup] эксперты первых ${N_CPU_MOE} слоёв остаются в оперативке"
+fi
+
 stage engine
 echo "[setup] запускаю модель из ${GGUF}"
 setsid nohup /root/llama.cpp/build/bin/llama-server \
@@ -88,8 +108,15 @@ setsid nohup /root/llama.cpp/build/bin/llama-server \
   --host 0.0.0.0 --port "${PORT}" \
   --api-key "${API_KEY}" \
   -c "${CTX}" -ngl 999 --split-mode layer \
+  ${MOE_ARG} \
   --parallel 1 --metrics \
   --flash-attn on --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --temp 0.7 --top-p 0.95 --min-p 0.02 > /root/engine.log 2>&1 < /dev/null &
+# Эксперты читаются из оперативки только после того, как файл окажется в страничном
+# кэше. Иначе первые минуты они подтягиваются с диска, и скорость вдвое ниже рабочей.
+if [ -n "${N_CPU_MOE}" ] && [ "${N_CPU_MOE}" -gt 0 ] 2>/dev/null; then
+  echo "[setup] прогреваю страничный кэш весами (${GGUF})"
+  ( cat "${GGUF}" > /dev/null 2>&1 & )
+fi
 echo "ONSTART DONE $(date)"

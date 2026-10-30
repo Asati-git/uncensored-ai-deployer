@@ -349,6 +349,24 @@ def net_down_est(server):
     return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
 
 
+# Сколько каналов памяти у процессора. Для выгрузки экспертов MoE в оперативку это
+# главный параметр сервера: скорость генерации упирается в пропускную способность RAM,
+# а не в карту. Clore каналы не сообщает, но модель процессора известна, а у семейств
+# она фиксированная: EPYC и Xeon Scalable — 8, Xeon E5 — 4, десктопные — 2.
+_RAM_CHANNELS = (
+    (re.compile(r"epyc|xeon.*(platinum|gold|silver|bronze)|threadripper", re.I), 8),
+    (re.compile(r"xeon", re.I), 4),
+)
+
+
+def ram_channels(server):
+    cpu = str((server.get("specs") or {}).get("cpu") or "")
+    for rx, n in _RAM_CHANNELS:
+        if rx.search(cpu):
+            return n
+    return 2
+
+
 def server_brief(server, rates=None):
     """Карточка сервера. Цены — в USD; валюта списания с баланса идёт отдельным полем."""
     count, name, vram = gpu_info(server)
@@ -365,6 +383,7 @@ def server_brief(server, rates=None):
         "disk": specs.get("disk"),
         "disk_speed": specs.get("disk_speed"),
         "cpu": specs.get("cpu"),
+        "ram_channels": ram_channels(server),      # важно только при выгрузке в RAM
         "net_down": net_down(server),             # как показывает Clore (последний замер)
         "net_down_est": net_down_est(server),      # на что рассчитывать: медиана замеров
         "net_tests": len(net_history(server)),

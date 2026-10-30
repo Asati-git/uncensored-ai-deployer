@@ -196,6 +196,7 @@ def api_get(path, q):
             gpu_filter=(q.get("gpu") or [""])[0] or None,
             order_type=(q.get("type") or ["on-demand"])[0],
             min_net=num("min_net", deploy.MIN_NET_DOWN_MBPS),
+            need_ram=num("ram", 0),
             download_gib=num("weights", 0),
             # движок и квант нужны, чтобы не предлагать карты, на которых они не заведутся
             engine=(q.get("engine") or [""])[0] or None,
@@ -263,6 +264,8 @@ def api_post(path, body):
             "gpu_filter": (body.get("gpu_filter") or "").strip() or None,
             "image": (body.get("image") or "").strip() or None,
             "gguf_file": (body.get("gguf_file") or "").strip() or None,
+            # эксперты MoE в оперативке: дешевле сервер ценой части скорости
+            "cpu_moe": bool(body.get("cpu_moe")),
             "ssh_password": (body.get("ssh_password") or "").strip() or None,
             "force": bool(body.get("force")),
             "dry_run": bool(body.get("dry_run")),
