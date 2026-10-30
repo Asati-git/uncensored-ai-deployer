@@ -33,6 +33,15 @@ h1 { margin: 0; font-size: 19px; letter-spacing: .4px; }
   border-bottom: 1px dashed var(--line); padding-bottom: 1px;
 }
 .tg:hover { color: var(--accent); border-bottom-color: var(--accent); }
+/* Clore — единственная ссылка в шапке, которая должна читаться как кнопка:
+   без аккаунта там софт просто не работает */
+.clore {
+  font-size: 12px; text-decoration: none; padding: 4px 11px; border-radius: 999px;
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--panel));
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+}
+.clore:hover { background: var(--accent-2); color: #fff; border-color: var(--accent-2); }
+.fields label a { color: var(--accent); }
 h1 span { color: var(--accent); }
 h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
 .head-right { display: flex; gap: 10px; align-items: center; }

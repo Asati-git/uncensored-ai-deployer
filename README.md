@@ -1,7 +1,7 @@
 # UncensoredAI — любая uncensored-модель с Hugging Face на GPU-сервере Clore.ai
 
 > **In English.** A local, dependency-free UI (Python stdlib only) that rents a GPU server on
-> [Clore.ai](https://clore.ai) and deploys any uncensored model from Hugging Face in one click.
+> [Clore.ai](https://clore.ai/register?ref_id=hwiqaztv) and deploys any uncensored model from Hugging Face in one click.
 > It picks the engine from the weight format (GGUF → llama.cpp, safetensors/AWQ/GPTQ/FP8 → vLLM,
 > EXL3/EXL2 → TabbyAPI), estimates VRAM from the model's own `config.json`, finds the cheapest
 > suitable server, waits for the build and download with live progress, then exposes an
@@ -10,7 +10,7 @@
 > automatically. Runs on Windows, macOS and Linux. The rest of this README is in Russian.
 
 Локальный UI: выбираете расцензуренную модель из подборки Hugging Face (или вставляете свою ссылку),
-вводите API-ключ [Clore.ai](https://clore.ai), жмёте «Арендовать и развернуть» — получаете
+вводите API-ключ [Clore.ai](https://clore.ai/register?ref_id=hwiqaztv), жмёте «Арендовать и развернуть» — получаете
 OpenAI-совместимый endpoint с вашим ключом и переключённый на него OpenCode.
 
 Движок подбирается по формату весов автоматически:
@@ -38,7 +38,7 @@ startup-скрипт сам откатывается на `hermes`.
    | macOS, Linux | `./ui.sh` (один раз `chmod +x *.sh`) |
    | любая | `python3 app.py` |
 
-2. Вкладка **Настройки**: вставьте `API-ключ Clore.ai` (кабинет clore.ai → Settings → API),
+2. Вкладка **Настройки**: вставьте `API-ключ Clore.ai` ([кабинет Clore](https://clore.ai/register?ref_id=hwiqaztv) → Settings → API),
    нажмите «сгенерировать» для ключа вашего API, при желании добавьте HF-токен и Telegram. «Сохранить».
 3. Вкладка **Модель**: подборка актуальных uncensored-моделей (uncensored / abliterated / unfiltered /
    amoral / heretic / dolphin …) с панелью периодов и фильтром по формату, либо своя ссылка —
