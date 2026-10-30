@@ -903,13 +903,35 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
 # СКЛАДЫВАЮТСЯ. Поэтому мало найти один файл: если в другом остался провайдер со старым
 # адресом, после слияния может победить именно он. Обновляем все, какие есть.
 # Источник: https://opencode.ai/docs/config/
-_OPENCODE_NAMES = ("opencode.json", "opencode.jsonc")
+# Имена, которые OpenCode перебирает в каталоге конфигов. config.json — старое имя,
+# оно до сих пор в списке поиска и может перебить новое.
+_OPENCODE_NAMES = ("opencode.json", "opencode.jsonc", "config.json")
 # Комментарии в .jsonc: убираем только вне строк, иначе «https://…» режется пополам
 _JSONC_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', re.S)
 
 
+def opencode_primary():
+    """
+    Файл, который OpenCode ТОЧНО прочитает. Именно его создаём, если конфига ещё нет.
+
+    Важно: на Windows это НЕ %APPDATA%. В самом OpenCode путь считается как
+    XDG_CONFIG_HOME или ~/.config на всех системах, ветки для %APPDATA% там нет —
+    в AppData/Roaming/opencode живут плагины. Мы раньше создавали конфиг именно там,
+    и у тех, у кого своего конфига ещё не было, модель в OpenCode просто не появлялась.
+    """
+    explicit = os.environ.get("OPENCODE_CONFIG")
+    if explicit:
+        return explicit
+    # OPENCODE_CONFIG_DIR в OpenCode заменяет глобальный каталог целиком, а не дополняет
+    base = os.environ.get("OPENCODE_CONFIG_DIR")
+    if base:
+        return os.path.join(base, "opencode.json")
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser(os.path.join("~", ".config"))
+    return os.path.join(xdg, "opencode", "opencode.json")
+
+
 def _opencode_dirs():
-    """Все каталоги, где OpenCode ищет конфиг, в порядке приоритета."""
+    """Каталоги, где может лежать конфиг. Нужны, чтобы подчистить устаревшие копии."""
     out, home = [], os.path.expanduser("~")
     explicit_dir = os.environ.get("OPENCODE_CONFIG_DIR")
     if explicit_dir:
@@ -917,12 +939,13 @@ def _opencode_dirs():
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg:
         out.append(os.path.join(xdg, "opencode"))
-    out.append(os.path.join(home, ".config", "opencode"))          # Linux, macOS и WSL
+    out.append(os.path.join(home, ".config", "opencode"))          # основной путь везде
+    out.append(home)                                               # ~/opencode.json тоже читается
     if sys.platform == "darwin":
         out.append(os.path.join(home, "Library", "Application Support", "opencode"))
-    for var in ("APPDATA", "LOCALAPPDATA"):                        # Windows
-        base = os.environ.get(var)
-        if base:
+    for var in ("APPDATA", "LOCALAPPDATA"):      # каталог плагинов: сам OpenCode сюда не ходит,
+        base = os.environ.get(var)               # но люди кладут конфиг и туда — обновим, чтобы
+        if base:                                 # старый адрес не остался в чужом файле
             out.append(os.path.join(base, "opencode"))
     seen, uniq = set(), []
     for d in out:
@@ -935,29 +958,23 @@ def _opencode_dirs():
 
 def opencode_configs(create=True):
     """
-    Список конфигов OpenCode, которые надо обновить. Если не нашлось ни одного,
-    возвращаем путь, по которому его нужно создать (при create=True).
+    Какие файлы править. Первым всегда идёт тот, который OpenCode читает гарантированно
+    (его и создаём, если его нет), дальше — все прочие найденные копии: конфиги
+    складываются, и забытый провайдер со старым адресом может пережить обновление.
     """
-    found = []
-    explicit = os.environ.get("OPENCODE_CONFIG")      # явный путь к файлу — всегда первый
-    if explicit:
-        found.append(explicit)
+    primary = opencode_primary()
+    found = [primary] if (create or os.path.isfile(primary)) else []
     for d in _opencode_dirs():
         for name in _OPENCODE_NAMES:
             path = os.path.join(d, name)
-            if os.path.isfile(path) and path not in found:
+            if os.path.isfile(path) and not any(os.path.normcase(os.path.abspath(path))
+                                                == os.path.normcase(os.path.abspath(f))
+                                                for f in found):
                 found.append(path)
     # Проектные конфиги (opencode.json рядом с кодом) намеренно не трогаем: текущий
     # каталог у нашего UI — это папка самого софта, и туда уехал бы API-ключ, а до
     # проекта пользователя, где он реально запускает OpenCode, мы всё равно не дотянемся.
-    if found or not create:
-        return found
-    # ничего нет — создаём там, где этого ждёт сам OpenCode на этой системе
-    default = os.environ.get("APPDATA") if os.name == "nt" else None
-    base = os.path.join(default, "opencode") if default else os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser(os.path.join("~", ".config")),
-        "opencode")
-    return [os.path.join(base, "opencode.json")]
+    return found
 
 
 def opencode_config_path():
@@ -997,6 +1014,19 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
     """
     paths = opencode_configs()
     ctx = int(ctx or DEFAULT_CTX)
+    # OPENCODE_CONFIG_DIR не дополняет глобальный конфиг, а заменяет его целиком:
+    # если переменную выставил кто-то другой, правки в ~/.config молча не применятся
+    shadow = os.environ.get("OPENCODE_CONFIG_DIR")
+    if shadow:
+        logf(f"внимание: задан OPENCODE_CONFIG_DIR={shadow} — OpenCode читает только его, "
+             f"остальные конфиги игнорируются")
+    # Конфиг в каталоге проекта перебивает глобальный. Проверить чужие проекты мы не можем,
+    # но про файл в текущем каталоге предупредить обязаны: именно он чаще всего и побеждает.
+    for name in _OPENCODE_NAMES:
+        local = os.path.join(os.getcwd(), name)
+        if os.path.isfile(local) and os.path.abspath(os.getcwd()) != os.path.abspath(HERE):
+            logf(f"внимание: рядом с вами лежит {local} — OpenCode возьмёт провайдера "
+                 f"оттуда, если запускать его в этом каталоге")
     written = []
     for path in paths:
         cfg = {}
@@ -1035,7 +1065,11 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
         logf("⚠️ ни один конфиг OpenCode не удалось обновить — пропишите провайдера вручную")
         return False
     OPENCODE_CFG_USED[:] = written
-    logf("OpenCode переключён: " + ", ".join(written))
+    logf(f"OpenCode переключён — его основной конфиг: {written[0]}")
+    if len(written) > 1:
+        logf("заодно обновлены другие найденные копии: " + ", ".join(written[1:]))
+    logf("если модели не видно: перезапустите OpenCode, а в списке ищите провайдера "
+         "«uncensored»")
     return True
 
 

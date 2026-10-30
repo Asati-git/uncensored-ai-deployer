@@ -161,12 +161,17 @@ Q4_K_M, а при одинаковом имени — файл покрупне�
 - `templates/onstart_*.sh` — startup-скрипты под TabbyAPI / llama.cpp / vLLM (едут в заказ в base64)
 - `opencode.sample.json` — образец провайдера для OpenCode. Сам `deploy.py` правит не его,
   а настоящие конфиги OpenCode: вписывает туда `baseURL`, `apiKey` и секцию `models`.
-  Ищет во всех местах, которые описаны в документации OpenCode, и обновляет **все**
-  найденные — конфиги там не заменяют друг друга, а складываются, поэтому забытый
-  провайдер со старым адресом в соседнем файле может пережить обновление главного:
-  `$OPENCODE_CONFIG` → `$OPENCODE_CONFIG_DIR` → `$XDG_CONFIG_HOME/opencode/` →
-  `~/.config/opencode/` → `~/Library/Application Support/opencode/` (macOS) →
-  `%APPDATA%\opencode\`, `%LOCALAPPDATA%\opencode\` (Windows).
+  Главный файл один и тот же на всех системах: `$OPENCODE_CONFIG`, иначе
+  `$OPENCODE_CONFIG_DIR/opencode.json`, иначе `$XDG_CONFIG_HOME/opencode/opencode.json`,
+  иначе `~/.config/opencode/opencode.json`. **На Windows это тоже `~/.config`, а не
+  `%APPDATA%`**: в самом OpenCode путь считается как `XDG_CONFIG_HOME || ~/.config` без
+  ветки для Windows, а в `AppData\Roaming\opencode` лежат плагины. Если конфиг положить
+  туда, OpenCode его не увидит и модель в списке не появится.
+  Остальные найденные копии (в том числе в `%APPDATA%`, `~/opencode.json` и старое имя
+  `config.json`) тоже обновляются: конфиги складываются, и забытый провайдер со старым
+  адресом может пережить обновление главного.
+  Отдельная кнопка «Прописать в OpenCode» на вкладке «Деплой» повторяет запись и
+  показывает точный путь — на случай, когда OpenCode поставили уже после деплоя.
   Понимает и `opencode.json`, и `opencode.jsonc` (комментарии при записи теряются —
   об этом пишется в лог). Если конфига нет вообще, создаёт его там, где его ждёт
   OpenCode на этой системе

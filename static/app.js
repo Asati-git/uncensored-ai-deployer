@@ -667,6 +667,19 @@ document.querySelectorAll('#periods button').forEach((b) => {
     searchModels();
   };
 });
+$('btn-opencode').onclick = async () => {
+  busy($('btn-opencode'), true, 'пишу…');
+  try {
+    const { paths } = await api('/api/opencode', {});
+    // путь показываем прямо в карточке: при проблеме «модели нет в списке» ищут именно его
+    $('current').insertAdjacentHTML('beforeend',
+      `<p class="muted">Провайдер записан в <code>${esc(paths[0])}</code>${
+        paths.length > 1 ? ` и ещё ${paths.length - 1} копии` : ''}. Перезапустите OpenCode
+        и выберите провайдера «uncensored».</p>`);
+    toast('конфиг OpenCode обновлён');
+  } catch (e) { toast(e.message, true); }
+  finally { busy($('btn-opencode'), false); }
+};
 $('btn-offers').onclick = loadOffers;
 $('f-cpu-moe').onchange = () => { applyNeed(); loadOffers(); };
 // Фильтр применяется к уже загруженному списку — поэтому мгновенно и без запроса к Clore

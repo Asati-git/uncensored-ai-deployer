@@ -227,6 +227,20 @@ def api_post(path, body):
             deploy.save_env_keys(updates)
         return {"ok": True, "saved": sorted(updates)}
 
+    if path == "/api/opencode":
+        # Отдельная кнопка: деплой мог пройти до установки OpenCode, и тогда провайдера
+        # прописывать было некуда. Заодно показывает точный путь — именно его ищут,
+        # когда «модели нет в списке».
+        current = deploy.load_env()
+        if not current.get("API_URL"):
+            raise ValueError("нет развёрнутой модели — сначала разверните её")
+        ok = deploy.update_opencode(current["API_URL"], current.get("API_KEY", ""),
+                                    (current.get("MODEL_REPO") or "").split("/")[-1],
+                                    logf=job_log,
+                                    ctx=int(current.get("CTX") or deploy.DEFAULT_CTX),
+                                    engine=current.get("ENGINE"))
+        return {"ok": ok, "paths": list(deploy.OPENCODE_CFG_USED)}
+
     if path == "/api/theme":
         # Оформление живёт отдельным файлом поверх style.css: так базовые стили остаются
         # нетронутыми, а выбранная тема — это несколько переопределённых переменных,
