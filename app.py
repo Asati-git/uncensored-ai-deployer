@@ -185,9 +185,13 @@ def api_get(path, q):
         rates = clore.currency_rates()
         bal_usd = sum(a * rates.get(c, 0) for c, a in deploy.wallet_balances(clore).items())
         hidden = {}   # сколько серверов отсеял каждый фильтр — показываем под списком
+        cpu_moe = (q.get("cpu_moe") or [""])[0] == "1"
         return {"balance_usd": round(bal_usd, 2),
                 "max_hourly_usd": round(bal_usd, 2) if bal_usd else 0,
                 "hidden": hidden,
+                # эхом возвращаем режим: по нему UI понимает, что сортировка учитывала
+                # каналы памяти, и показывает их в карточке сервера
+                "cpu_moe": cpu_moe,
                 "offers": deploy.find_offers(
             clore,
             need_vram=num("vram", 0),
@@ -202,6 +206,9 @@ def api_get(path, q):
             engine=(q.get("engine") or [""])[0] or None,
             quant=(q.get("quant") or [""])[0] or None,
             allow_old_gpu=(q.get("old_gpu") or [""])[0] == "1",
+            # эксперты в оперативке: меняет не фильтр, а сортировку — сервер с восемью
+            # каналами памяти выигрывает у вдвое более дешёвого двухканального
+            cpu_moe=cpu_moe,
             balance_usd=bal_usd or None,
             hidden=hidden,
             limit=int(num("limit", 30)))}

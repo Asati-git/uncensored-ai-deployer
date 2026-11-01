@@ -38,6 +38,13 @@ ENGINE_VLLM = "vllm"          # safetensors fp16/awq/gptq/fp8 -> vLLM
 
 GIB = 1024 ** 3
 
+# Контекст по умолчанию. Берём нативный из конфига модели, но с потолком: у свежих Qwen
+# заявлены 262k, а с YaRN и до 1M, и на таком контексте один KV-кэш требует больше VRAM,
+# чем сама модель — подбор уезжает в мультиGPU там, где он не нужен. Потолок снимается
+# вручную: поле «контекст» в UI или --ctx в CLI принимают любое значение до ctx_max.
+DEFAULT_CTX = 32768
+CTX_CAP = 131072
+
 
 # ---------- HTTP ----------
 def _get(path, token=None, timeout=25):
@@ -679,13 +686,23 @@ def kv_cache_gib(cfg, ctx, engine):
     return round(attn_layers * per_token * ctx * nbytes / GIB, 1)
 
 
-def _max_ctx(repo_id, token=None):
-    try:
-        cfg = _get(f"models/{urllib.parse.quote(repo_id)}?blobs=false", token)
-    except RuntimeError:
-        return None
-    for key in ("max_position_embeddings", "model_max_length"):
-        val = ((cfg.get("config") or {}).get("tokenizer_config") or {}).get(key)
+def model_max_ctx(cfg):
+    """
+    Нативный контекст модели — из её конфига.
+
+    Раньше тут был отдельный запрос к HF API за полем
+    `config.tokenizer_config.max_position_embeddings`, и он ВСЕГДА возвращал None:
+    в блоке `config` Hugging Face отдаёт только `architectures`, `model_type`,
+    `chat_template_jinja` и `tokenizer_config` с именами спецтокенов. Ни
+    `max_position_embeddings`, ни `model_max_length` там нет ни у одного репозитория.
+    Из-за этого каждый деплой молча уезжал на DEFAULT_CTX: llama.cpp получал
+    `-c 32768` при нативных 262144 у Qwen3.8, и контекст приходилось поднимать руками.
+
+    Конфиг сюда приходит уже разобранный (_raw_config разворачивает text_config,
+    _config_with_base достаёт его у предка по base_model) — у GGUF-сборок своего нет.
+    """
+    for key in ("max_position_embeddings", "model_max_length", "n_positions"):
+        val = cfg.get(key)
         if val:
             return int(val)
     return None
@@ -822,7 +839,7 @@ def moe_profile(cfg):
     }
 
 
-def cpu_moe_estimate(moe, weights_gib, kv_gib):
+def cpu_moe_estimate(moe, weights_gib, kv_gib, vocab=0):
     """
     Во что обходится полная выгрузка экспертов: сколько останется на карте и сколько
     понадобится оперативки. Отдельно — вес экспертов одного слоя: по нему считается,
@@ -833,7 +850,9 @@ def cpu_moe_estimate(moe, weights_gib, kv_gib):
     expert_gib = weights_gib * moe["expert_share"]
     on_gpu = max(weights_gib - expert_gib, 0.2)
     return {
-        "vram_gib": vram_estimate(round(on_gpu, 1), kv_gib),
+        # буфер логитов остаётся на карте даже когда все эксперты уехали в RAM,
+        # поэтому vocab передаём и здесь — иначе оценка занижена вдвое
+        "vram_gib": vram_estimate(round(on_gpu, 1), kv_gib, vocab),
         # оперативка: сами эксперты + запас на загрузчик и страничный кэш
         "ram_gb": int(expert_gib * 1.2 + 6),
         "per_layer_gib": round(expert_gib / max(moe["moe_layers"], 1), 3),
@@ -872,17 +891,55 @@ def cpu_moe_layers(moe_info, need_vram_gib, have_vram_gib, card_gib=None):
     return max(0, min(total, max(by_total, by_card)))
 
 
-def vram_estimate(weights_gib, kv_gib):
+# Накладные расходы движка поверх весов и KV-кэша.
+# UBATCH — физический батч llama.cpp по умолчанию. Буфер логитов выделяется под него и
+# считается как vocab x ubatch x 4 байта: у Qwen3.8 словарь 248 320 токенов, и это 0.47
+# ГиБ одним куском — больше, чем вся прежняя константа накладных расходов.
+UBATCH = 512
+ENGINE_BASE_GIB = 1.0      # CUDA-контекст и графовые буферы
+FALLBACK_LOGITS_GIB = 0.3  # когда размер словаря неизвестен
+
+
+def vram_estimate(weights_gib, kv_gib, vocab=0):
     """
-    Сколько VRAM нужно под веса. Накладные расходы движка (графы, буферы вычислений,
-    фрагментация) почти не зависят от размера модели, поэтому это не процент от весов,
-    а небольшая константа с поправкой на масштаб.
+    Сколько VRAM нужно под веса и кэш.
+
+    Прежняя формула (1.5 + веса x 0.02, не больше 8) давала 1.8-1.9 ГиБ накладных для
+    моделей на 16-22 ГиБ и этого не хватало: в ней не было ни CUDA-контекста, ни буфера
+    логитов, который у моделей с большим словарём сам по себе занимает полгигабайта.
+    Модель на 20 ГиБ проходила на карту с ровно 20 ГиБ и падала по OOM.
+
+    Это оценка «сколько займёт», а не «какую карту брать»: запас на то, что оценка
+    неточна, добавляет VRAM_HEADROOM при подборе сервера.
     """
-    overhead = min(8.0, 1.5 + weights_gib * 0.02)
+    logits = vocab * UBATCH * 4 / GIB if vocab else FALLBACK_LOGITS_GIB
+    overhead = min(12.0, ENGINE_BASE_GIB + logits + weights_gib * 0.05)
     return round(weights_gib + kv_gib + overhead, 1)
 
 
-def _gguf_options(entries, ctx, kv_gib, moe=None):
+CTX_FLOOR = 4096        # ниже опускаться незачем: на таком контексте кодить нельзя
+
+
+def ctx_for_vram(ctx, kv_gib, weights_gib, have_vram_gib, vocab=0):
+    """
+    Наибольший контекст не выше запрошенного, при котором модель влезает в have_vram_gib.
+
+    Нужен потому, что контекст задают до выбора сервера. Поставил 262144, взял карту на
+    24 ГиБ — и деплой падал по OOM через полчаса после начала скачивания весов, без
+    единого предупреждения. KV-кэш линеен по контексту (см. kv_cache_gib), поэтому
+    пересчитываем его пропорцией от уже известной оценки, не читая конфиг заново.
+    Шаг — деление вдвое: так контекст остаётся степенью двойки, как его и ждут движки.
+    """
+    if ctx <= 0 or not weights_gib or not have_vram_gib:
+        return ctx
+    per_token = kv_gib / ctx
+    out = ctx
+    while out > CTX_FLOOR and vram_estimate(weights_gib, per_token * out, vocab) > have_vram_gib:
+        out //= 2
+    return out
+
+
+def _gguf_options(entries, ctx, kv_gib, moe=None, vocab=0):
     """
     Группирует GGUF-файлы по квантам (шарды одного кванта — в одну запись)
     и считает для каждого размер и оценку VRAM/диска. Служебные файлы отбрасываются.
@@ -913,10 +970,10 @@ def _gguf_options(entries, ctx, kv_gib, moe=None):
         opt = {
             "path": g["path"], "label": name, "parts": g["parts"],
             "weights_gib": weights, "bpw": _quant_bpw(name),
-            "vram_gib": vram_estimate(weights, kv_gib),
+            "vram_gib": vram_estimate(weights, kv_gib, vocab),
             "disk_gb": int(weights * 1.15 + 20),
         }
-        off = cpu_moe_estimate(moe, weights, kv_gib)
+        off = cpu_moe_estimate(moe, weights, kv_gib, vocab)
         if off:
             opt["vram_cpu_moe_gib"] = off["vram_gib"]
             opt["ram_gb"] = off["ram_gb"]
@@ -1017,18 +1074,22 @@ def model_info(ref, ctx=None, token=None):
     fmt = detect_format(repo_id, tags, files)
     engine = engine_for(fmt)
     weights = _weight_bytes(entries)
-    ctx = int(ctx) if ctx else (_max_ctx(repo_id, token) or 32768)
 
-    # KV-кэш считаем по конфигу модели: у GGUF-репозитория своего конфига нет,
+    # Конфиг читаем до контекста: из него берётся и нативный максимум контекста, и
+    # размер словаря для буфера логитов. У GGUF-репозитория своего конфига нет,
     # поэтому берём его у исходной модели, указанной в карточке как base_model
     own_cfg = _raw_config(repo_id, token)   # собственный конфиг: из него берём квантование
     cfg = _config_with_base(repo_id, meta, own_cfg, token)
+    ctx_max = model_max_ctx(cfg)
+    ctx = int(ctx) if ctx else min(ctx_max or DEFAULT_CTX, CTX_CAP)
+    vocab = int(cfg.get("vocab_size") or 0)
+
     kv_gib = kv_cache_gib(cfg, ctx, engine)
     kv_known = kv_gib is not None
 
     # GGUF-репозиторий — это набор квантов; рабочий вес задаёт выбранный, а не весь репозиторий
     moe = moe_profile(cfg)
-    all_options = (_gguf_options(entries, ctx, kv_gib if kv_known else 0.0, moe)
+    all_options = (_gguf_options(entries, ctx, kv_gib if kv_known else 0.0, moe, vocab)
                    if fmt == "gguf" else [])
     options, low_only = _usable_quants(all_options)
     low_only = low_only and bool(all_options)  # у не-GGUF репозиториев квантов нет вовсе
@@ -1042,12 +1103,12 @@ def model_info(ref, ctx=None, token=None):
         # конфиг недоступен (бывает, когда базовый репозиторий удалили) — считаем грубо:
         # у плотной модели с GQA KV-кэш это примерно 0.25 ГиБ на миллиард параметров при 32k
         params = detect_params(repo_id) or max(weights_gib, 1.0)
-        kv_gib = round(max(0.5, params * 0.25 * (ctx / 32768)
+        kv_gib = round(max(0.5, params * 0.25 * (ctx / DEFAULT_CTX)
                            * KV_BYTES.get(engine, 2) / 2), 1)
-    vram_gib = vram_estimate(weights_gib, kv_gib) if weights_gib else 0.0
+    vram_gib = vram_estimate(weights_gib, kv_gib, vocab) if weights_gib else 0.0
     # вторая оценка: эксперты в оперативке. Нужна и UI (показать выгоду), и подбору
     # сервера (одна карта вместо четырёх), и деплою (сколько слоёв выгружать)
-    offload = cpu_moe_estimate(moe, weights_gib, kv_gib)
+    offload = cpu_moe_estimate(moe, weights_gib, kv_gib, vocab)
     # диск: веса + распакованный кэш загрузчика и система
     disk_gb = int(weights_gib * 1.15 + 20) if weights_gib else 60
 
@@ -1074,7 +1135,13 @@ def model_info(ref, ctx=None, token=None):
         "gguf_dropped": dropped,                        # сколько квантов ниже Q4_K_M скрыто
         "gguf_low_only": low_only,                      # годных нет вообще — показываем как есть
         "ctx": ctx,
+        "ctx_max": ctx_max,     # нативный потолок модели; None — в конфиге не нашлось
+        "ctx_capped": bool(ctx_max and ctx_max > CTX_CAP),  # дефолт урезан нашим потолком
+        "vocab": vocab,
         "vram_gib": vram_gib,
+        # накладные расходы движка отдельной цифрой: в UI они объясняют разницу между
+        # «веса + KV» и итогом, и повторять формулу в JS не нужно
+        "overhead_gib": round(vram_gib - weights_gib - kv_gib, 1) if weights_gib else 0.0,
         "moe": moe,                                     # эксперты: сколько их и какая доля веса
         "cpu_moe": offload,                             # во что обойдётся выгрузка в RAM
         "vram_cpu_moe_gib": offload["vram_gib"] if offload else None,

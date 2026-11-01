@@ -45,7 +45,7 @@ API_PORT = 5000                 # внутренний порт движка в 
 STATUS_PORT = 5001
 GIB_BYTES = 1024 ** 3
 MODEL_NAME = "uncensored"       # id модели в OpenAI-совместимом API (не меняется при смене весов)
-DEFAULT_CTX = 32768
+DEFAULT_CTX = hfmodels.DEFAULT_CTX   # запасной вариант: реальный берётся из конфига модели
 DEFAULT_CURRENCY = "bitcoin"
 
 IMAGES = {
@@ -74,6 +74,14 @@ SPREAD_MIN = 10                 # минимум кандидатов в пер�
 SPREAD_HARD_CAP = 2.0           # дороже лучшего предложения вдвое — не берём даже при --spread
 # Во сколько раз больше VRAM требовать от vLLM-сервера, если число карт не степень двойки
 VLLM_UNEVEN_HEADROOM = 1.4
+# Запас поверх оценки VRAM. Раньше его не было вовсе: карта с ровно 20.0 ГиБ проходила
+# фильтр для модели, которой насчитали 20.0 — то есть впритык, без права на ошибку в
+# оценке. Запас нужен всем трём движкам, но по разным причинам:
+#   * vLLM стартует с --gpu-memory-utilization 0.92, то есть модель обязана уложиться
+#     в 92% карты; 1/0.92 это уже 1.087;
+#   * llama.cpp докладывает CUDA-контекст и графовые буферы на каждое устройство;
+#   * TabbyAPI с gpu_split_auto оставляет себе место под активации сам.
+VRAM_HEADROOM = 1.1
 # Предел длины поля command у Clore. Найден перебором: 16384 Б проходит, 16465 — уже
 # HTTP 500 без пояснений. Поэтому startup-скрипт едет сжатым.
 COMMAND_LIMIT = 16384
@@ -539,7 +547,8 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
         if balance_usd and price > balance_usd:
             bump("не хватает даже на час")
             continue
-        need = need_vram
+        # запас на неточность оценки: карта «ровно под размер» гарантированно падает по OOM
+        need = need_vram * VRAM_HEADROOM if need_vram else 0
         # vLLM шардирует веса ровно только при tensor-parallel, а он требует числа карт,
         # кратного степени двойки. На 3 или 5 картах остаётся чистый pipeline-параллелизм:
         # слои ложатся неравномерно, первая карта переполняется и загрузка падает по OOM.
@@ -1214,6 +1223,24 @@ def deploy(cfg, env=None, logf=log):
                  f"({offer['vram_gb']} GiB VRAM против {info['vram_gib']} нужных)")
         elif cpu_moe:
             logf(f"карта вмещает модель целиком — выгрузка не нужна")
+        # Контекст задают до выбора сервера, поэтому он может в карту и не влезть.
+        # Подгоняем под фактическую VRAM: иначе OOM через полчаса после начала скачивания.
+        gpu_weights = info["weights_gib"] - (n_cpu_moe * offload["per_layer_gib"]
+                                             if n_cpu_moe else 0)
+        fit_ctx = hfmodels.ctx_for_vram(info["ctx"], info["kv_gib"], gpu_weights,
+                                        offer["vram_gb"] / VRAM_HEADROOM,
+                                        info.get("vocab") or 0)
+        order_env["CTX"] = str(fit_ctx)
+        fit_need = hfmodels.vram_estimate(gpu_weights, info["kv_gib"] * fit_ctx / info["ctx"],
+                                          info.get("vocab") or 0)
+        if fit_need > offer["vram_gb"]:
+            # даже на минимальном контексте не влезает: бывает только при ручном выборе
+            # сервера, фильтр такие предложения не пропускает
+            logf(f"⚠️ модель не влезает в {offer['vram_gb']} GiB VRAM ни при каком контексте "
+                 f"(нужно {fit_need} GiB даже при {fit_ctx}) — запуск, скорее всего, упадёт по OOM")
+        elif fit_ctx < info["ctx"]:
+            logf(f"⚠️ контекст {info['ctx']} не влезает в {offer['vram_gb']} GiB VRAM — "
+                 f"ставлю {fit_ctx}. Нужен полный контекст — берите карту крупнее")
         logf(f"арендую сервер {sid} ({offer['gpu_count']}x {offer['gpu']}) за ${usd:.3f}/ч "
              f"(списание {amount:g} {currency}/сутки)")
         # Запоминаем, какие заказы на этом сервере уже есть: иначе чужой (или свой прошлый)
@@ -1303,7 +1330,7 @@ def deploy(cfg, env=None, logf=log):
         ssh = f"ssh -p {acc['ports'].get(22, 22)} root@{host}"
         save_env_keys({"ORDER": str(oid), "SERVER": str(sid), "API_URL": api_url, "SSH": ssh,
                        "MODEL_REPO": info["repo_id"], "MODEL_NAME": MODEL_NAME,
-                       "CTX": str(info["ctx"]), "ENGINE": info["engine"]})
+                       "CTX": str(fit_ctx), "ENGINE": info["engine"]})
         logf(f"контейнер поднят. API будет на {api_url}; {ssh} (пароль: {ssh_password})")
 
         sign = wait_alive(host, acc["ports"], api_url, api_key, logf)
@@ -1336,7 +1363,7 @@ def deploy(cfg, env=None, logf=log):
         # при пакетных прогонах переключать OpenCode на каждую проверяемую модель незачем
         if not cfg.get("skip_opencode"):
             update_opencode(api_url, api_key, info["repo_id"].split("/")[-1], logf,
-                            ctx=info["ctx"], engine=info["engine"])
+                            ctx=fit_ctx, engine=info["engine"])
         # Баланс нужен только для справочной строки. Раньше разовый сбой сети здесь ронял
         # полностью удавшийся деплой: модель уже работала, а в лог уходило «⛔ ошибка API»
         # вместо адреса и скорости.

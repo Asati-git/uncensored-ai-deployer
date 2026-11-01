@@ -39,9 +39,90 @@
     <h2>Своя ссылка на Hugging Face</h2>
     <p class="muted">Можно вставить полный URL репозитория или просто <code>owner/name</code>.
       Формат весов определяется автоматически: GGUF → llama.cpp, safetensors/AWQ/GPTQ/FP8 → vLLM.</p>
+
+    <!-- Формат — первое, обо что спотыкаются: в подборке рядом лежат «Model-GGUF» и
+         «Model», и по названию не видно, что это одна модель под разные движки. -->
+    <details class="explain" id="explain-formats">
+      <summary>Что такое GGUF и не-GGUF, и что из этого выбирать</summary>
+      <div class="explain-body">
+        <p>Это два способа хранить веса модели, и за каждым стоит свой движок. Одну и ту же
+          модель часто выкладывают в обоих форматах — тогда это не два разных пункта списка,
+          а варианты одной записи: сначала выбирают модель, формат — уже под сервер.</p>
+
+        <table class="cmp">
+          <tr>
+            <th></th>
+            <th>safetensors <span class="muted">— «не-GGUF»</span></th>
+            <th>GGUF</th>
+          </tr>
+          <tr>
+            <td>Что это</td>
+            <td>исходные веса от автора модели: тензоры как есть плюс <code>config.json</code> рядом</td>
+            <td>формат llama.cpp: веса, конфиг и токенайзер в одном файле (или в шардах
+              <code>-00001-of-00004</code>)</td>
+          </tr>
+          <tr>
+            <td>Движок</td>
+            <td><b>vLLM</b></td>
+            <td><b>llama.cpp</b></td>
+          </tr>
+          <tr>
+            <td>Точность</td>
+            <td>bf16/fp16 — полный размер. Квантованные варианты (FP8, NVFP4, GPTQ, AWQ)
+              выкладывают <i>отдельными репозиториями</i></td>
+            <td>квантован сразу, и кванты лежат в одном репозитории — выбор появляется
+              после «Выбрать»</td>
+          </tr>
+          <tr>
+            <td>Размер</td>
+            <td>Qwen3.8-Flash-Next в bf16 — <b>335 ГиБ</b></td>
+            <td>та же модель в Q4_K_XL — <b>104 ГиБ</b></td>
+          </tr>
+          <tr>
+            <td>Где лежит</td>
+            <td>только в VRAM и целиком. Не влезла — нужна ещё карта</td>
+            <td>можно держать часть в обычной оперативке, считая её на CPU</td>
+          </tr>
+          <tr>
+            <td>Скорость</td>
+            <td>быстрее: батчинг, PagedAttention, параллельные запросы</td>
+            <td>медленнее, и тем сильнее, чем больше выгружено в RAM</td>
+          </tr>
+          <tr>
+            <td>Карты</td>
+            <td>нужен Ampere и новее (CC ≥ 8.0)</td>
+            <td>работает и на Pascal/Turing, просто медленно</td>
+          </tr>
+        </table>
+
+        <p><b>Буквы в имени кванта.</b> <code>Q4_K_M</code>: <code>Q</code> — квантован,
+          <code>4</code> — бит на вес, <code>K</code> — k-quants (разная точность для разных
+          тензоров), <code>_S/_M/_L/_XL</code> — размер внутри схемы. <code>IQ</code> —
+          importance-aware, калибруются на данных. <code>UD</code> — Unsloth Dynamic.
+          <code>BF16</code>/<code>F16</code> — без квантования. Для кода действует правило
+          <b>не ниже Q4_K_M</b>: ниже модель начинает терять скобки и отступы, и такие
+          кванты в список не попадают.</p>
+
+        <p><b>Что формат меняет здесь:</b></p>
+        <ul class="hint">
+          <li>выгрузка экспертов MoE в оперативку (галочка на вкладке «Сервер») есть
+            <b>только у GGUF</b> — у vLLM такого механизма нет;</li>
+          <li>старые карты показываются тоже только для GGUF: vLLM и TabbyAPI на них не стартуют;</li>
+          <li>KV-кэш у llama.cpp в <code>q8_0</code> — 1 байт на токен против 2 у vLLM в fp16,
+            то есть при том же контексте он вдвое меньше;</li>
+          <li>FP8-сборки safetensors на Ampere работают через Marlin и медленнее, а NVFP4
+            требует Blackwell — для GGUF таких ограничений нет.</li>
+        </ul>
+
+        <p class="rule">Коротко: <b>safetensors</b> — когда VRAM хватает и нужна скорость.
+          <b>GGUF</b> — когда VRAM мало, а модель большая. У огромной MoE второй вариант
+          почти всегда выгоднее по деньгам.</p>
+      </div>
+    </details>
+
     <div class="row">
       <input id="model-ref" type="text" placeholder="https://huggingface.co/owner/model-name  или  owner/model-name" spellcheck="false">
-      <input id="model-ctx" type="number" placeholder="контекст" min="2048" step="1024" title="Контекст; пусто — из конфига модели">
+      <input id="model-ctx" type="number" placeholder="контекст" min="2048" step="1024" title="Контекст. По умолчанию берётся нативный из конфига модели, но не больше 131072: на полном контексте KV-кэш требует больше VRAM, чем сама модель. Изменение применяется сразу — VRAM и список серверов пересчитываются">
       <button id="btn-pick" class="primary">Выбрать</button>
     </div>
     <div id="model-card" class="model-card hidden"></div>
@@ -69,8 +150,11 @@
       <button id="btn-search" class="primary">Искать</button>
     </div>
     <ul class="hint">
-      <li><b>safetensors / vLLM</b> — больше нагрузка на железо, быстрее работает на большом контексте</li>
-      <li><b>GGUF</b>, квант Q4_K_M или Q5_K_M — если экономите или карта одна на 24 ГБ</li>
+      <li><b>safetensors / vLLM</b> — модель целиком в VRAM, зато быстрее на большом контексте
+        и на параллельных запросах</li>
+      <li><b>GGUF / llama.cpp</b>, квант Q4_K_M или Q5_K_M — если карта одна или экономите:
+        веса вчетверо меньше, часть можно держать в оперативке</li>
+      <li><a href="#" id="to-formats">чем GGUF отличается от не-GGUF — подробно &rarr;</a></li>
     </ul>
     <div id="models" class="list"></div>
   </div>

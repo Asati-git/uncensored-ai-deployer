@@ -345,13 +345,18 @@ function renderModelCard(m) {
       <div class="kv"><b id="kv-ram">${m.ram_gb} GB</b><span>нужно RAM для этого</span></div>` : ''}
       <div class="kv"><b>${m.kv_gib} GiB</b><span>KV-кэш${m.kv_known ? '' : ' (оценка)'}</span></div>
       <div class="kv"><b id="kv-disk">${m.disk_gb} GB</b><span>нужно диска</span></div>
-      <div class="kv"><b>${fmtCtx(m.ctx)}</b><span>контекст</span></div>
+      <div class="kv"><b>${fmtCtx(m.ctx)}</b><span>контекст${
+        m.ctx_max && m.ctx_max > m.ctx ? ` (модель умеет ${fmtCtx(m.ctx_max)})` : ''}</span></div>
       <div class="kv"><b>${fmtK(m.downloads)}</b><span>скачиваний</span></div>
     </div>
     <div class="quant-slot"></div>
-    <p class="muted" style="margin:10px 0 0">VRAM = веса + KV-кэш под выбранный контекст + ~${Math.min(8, 1.5 + m.weights_gib * 0.02).toFixed(1)} GiB на буферы движка.
+    <p class="muted" style="margin:10px 0 0">VRAM = веса + KV-кэш под выбранный контекст + ~${m.overhead_gib} GiB на буферы движка
+      (CUDA-контекст, графы и буфер логитов${m.vocab ? ` — словарь ${fmtK(m.vocab)} токенов` : ''}).
       ${m.kv_known ? 'KV посчитан по конфигу модели' : 'Конфиг модели недоступен — KV прикинут по числу параметров'};
-      у llama.cpp кэш в q8_0, у vLLM в fp16.</p>
+      у llama.cpp кэш в q8_0, у vLLM в fp16. При подборе сервера к этой цифре добавляется 10% запаса.</p>
+    ${m.ctx_max && m.ctx_max > m.ctx ? `<p class="muted" style="margin:6px 0 0">Модель держит
+      ${fmtCtx(m.ctx_max)} контекста, по умолчанию берём ${fmtCtx(m.ctx)}: на полном KV-кэш
+      требует больше VRAM, чем сама модель. Поднять — поле «контекст» выше, пересчитается сразу.</p>` : ''}
     ${m.cpu_moe ? `<p class="muted" style="margin:6px 0 0">Это MoE: ${m.moe.experts} экспертов,
       на токен работают ${m.moe.active}. Поэтому их можно держать в обычной оперативке и считать
       на CPU: карта нужна в разы скромнее. Но и скорость падает в разы — на одной и той же
@@ -384,7 +389,8 @@ function offerMatches(query, o) {
 // на сервере: иначе каждая буква в поле «Поиск» дёргала бы маркетплейс Clore заново.
 function renderOffers() {
   const box = $('offers');
-  const { offers = [], balance_usd, max_hourly_usd, hidden } = state.offersData || {};
+  const { offers = [], balance_usd, max_hourly_usd, hidden, cpu_moe: byRam }
+    = state.offersData || {};
   const query = $('f-gpu').value.trim();
   const shown = query ? offers.filter((o) => offerMatches(query, o)) : offers;
 
@@ -410,8 +416,15 @@ function renderOffers() {
   const foundNote = query
     ? `<p class="muted">По запросу «${esc(query)}» — <b>${shown.length}</b> из ${offers.length} загруженных.</p>`
     : '';
+  // С экспертами в оперативке карта почти не участвует в генерации, поэтому порядок тут
+  // другой: цена приведена «к токену» через каналы памяти. Без этой строки список
+  // выглядит так, будто он сортирован неправильно — дешёвый сервер стоит не первым.
+  const ramNote = byRam
+    ? `<p class="muted">Эксперты в оперативке: скорость определяет не карта, а пропускная
+       способность RAM, поэтому порядок — по цене <b>за токен</b>, а не за час.
+       Восьмиканальный EPYC обгоняет вдвое более дешёвый двухканальный десктоп.</p>` : '';
 
-  box.innerHTML = limitNote + hiddenNote + banNote + foundNote;
+  box.innerHTML = limitNote + hiddenNote + banNote + ramNote + foundNote;
   const clearLink = $('ban-clear');
   if (clearLink) {
     clearLink.onclick = async (e) => {
@@ -436,7 +449,11 @@ function renderOffers() {
         <div class="name">${o.gpu_count}× ${esc(o.gpu)}
           ${o.arch ? `<span class="badge ${o.gpu_ok === false ? 'gated' : o.gpu_note ? 'warn' : ''}">${esc(o.arch)}</span>` : ''}
           <span class="muted">· id ${o.id}</span></div>
-        <div class="meta">${o.vram_gb} GiB VRAM · ${o.ram_gb} GB RAM · диск ${o.disk_gb || '?'} GB ·
+        <div class="meta">${o.vram_gb} GiB VRAM · ${o.ram_gb} GB RAM${
+            // Каналы памяти показываем только в режиме выгрузки: там от них напрямую
+            // зависит скорость генерации, в остальных случаях это лишняя цифра
+            byRam && o.ram_channels ? ` <b>${o.ram_channels}-канальная</b>` : ''
+          } · диск ${o.disk_gb || '?'} GB ·
           ↓${Math.round(o.net_down)} Mbps${
             // Clore показывает последний замер, а он бывает разовым всплеском: считаем по
             // медиане истории и показываем её, когда она заметно ниже заявленного
@@ -505,6 +522,11 @@ async function loadOffers() {
       // без модели движок неизвестен — тогда показываем всё, включая старые карты
       engine: state.model?.engine || '', quant: state.model?.precision || '',
       old_gpu: $('f-old-gpu')?.checked ? '1' : '',
+      // С экспертами в оперативке скорость определяет не карта, а пропускная способность
+      // RAM, и сортировать предложения надо иначе. Без этого флага список показывал
+      // «лучшую цену» на двухканальном десктопе, а деплой брал восьмиканальный EPYC —
+      // список и автоподбор расходились на ровном месте.
+      cpu_moe: cpuMoeOn() ? '1' : '',
     });
     if ($('f-price').value.trim()) q.set('max_price', $('f-price').value.trim());
     state.offersData = await api('/api/offers?' + q);
@@ -659,7 +681,19 @@ async function saveSettings() {
 // ───────── привязка ─────────
 $('btn-pick').onclick = pickModel;
 $('model-ref').addEventListener('keydown', (e) => { if (e.key === 'Enter') pickModel(); });
+// Контекст меняет и KV-кэш, и требование к VRAM, и список подходящих серверов. Без этого
+// обработчика поле было декоративным: введённое значение не применялось ничем, а pickModel
+// при следующем нажатии «Выбрать» ещё и затирал его обратно.
+$('model-ctx').onchange = () => { if (state.model) pickModel(); };
 $('btn-search').onclick = searchModels;
+// Справочник по форматам лежит в карточке выше, свёрнутым. Ссылка из подсказки под фильтром
+// раскрывает его и подводит к нему — иначе про него просто не узнают.
+$('to-formats').onclick = (e) => {
+  e.preventDefault();
+  const d = $('explain-formats');
+  d.open = true;
+  d.scrollIntoView({ behavior: 'smooth', block: 'center' });
+};
 $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchModels(); });
 $('fmt').onchange = searchModels;
 document.querySelectorAll('#periods button').forEach((b) => {

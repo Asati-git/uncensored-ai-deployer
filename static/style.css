@@ -115,6 +115,37 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .hint b { color: var(--text); font-weight: 600; }
 .hidden { display: none !important; }
 
+/* Раскрывающийся справочник (чем GGUF отличается от safetensors). Свёрнут по умолчанию:
+   объяснение нужно один раз, а список моделей под ним — каждый раз. */
+.explain { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.explain > summary {
+  cursor: pointer; padding: 9px 12px; font-size: 13px; color: var(--accent);
+  list-style-position: outside;
+}
+.explain > summary:hover { color: var(--text); }
+.explain[open] > summary { border-bottom: 1px solid var(--line); color: var(--text); }
+.explain-body { padding: 10px 12px 12px; font-size: 12px; color: var(--muted); }
+.explain-body p { margin: 0 0 9px; max-width: 95ch; }
+.explain-body b { color: var(--text); font-weight: 600; }
+.explain-body .hint { margin: 0 0 9px; }
+.explain-body > *:last-child { margin-bottom: 0; }
+.explain-body .rule {
+  border-left: 2px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+  padding-left: 10px; color: color-mix(in srgb, var(--text) 75%, var(--muted));
+}
+
+/* Сравнение форматов: две колонки против подписи строки. На узком экране таблица
+   прокручивается, а не ломает карточку. */
+.cmp { width: 100%; border-collapse: collapse; margin: 0 0 11px; font-size: 12px; }
+.cmp th, .cmp td { text-align: left; vertical-align: top; padding: 6px 9px; border-top: 1px solid var(--line); }
+.cmp tr:first-child th { border-top: none; color: var(--text); font-size: 13px; }
+.cmp td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+.cmp td:not(:first-child) { color: color-mix(in srgb, var(--text) 72%, var(--muted)); }
+.cmp b { color: var(--text); font-weight: 600; }
+@media (max-width: 760px) {
+  .cmp { display: block; overflow-x: auto; }
+}
+
 .list { display: grid; gap: 8px; margin-top: 10px; }
 .item {
   display: flex; justify-content: space-between; gap: 14px; align-items: center;
