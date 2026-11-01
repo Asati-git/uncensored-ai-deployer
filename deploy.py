@@ -918,6 +918,14 @@ _OPENCODE_NAMES = ("opencode.json", "opencode.jsonc", "config.json")
 # Комментарии в .jsonc: убираем только вне строк, иначе «https://…» режется пополам
 _JSONC_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', re.S)
 
+# Идентификатор провайдера в конфиге. Совпадает с MODEL_NAME намеренно: в списке моделей
+# OpenCode это выглядит как «uncensored/uncensored», и искать нужно одно слово.
+OPENCODE_PROVIDER = MODEL_NAME
+# Драйвер OpenAI-совместимого API. В схеме v1 поле называется npm, в v2 — package, и
+# пакеты AI SDK там идут с префиксом «aisdk:» (https://opencode.ai/v2/docs/migrate-v1/).
+OPENCODE_NPM = "@ai-sdk/openai-compatible"
+OPENCODE_PKG_V2 = f"aisdk:{OPENCODE_NPM}"
+
 
 def opencode_primary():
     """
@@ -1015,6 +1023,81 @@ def _read_config(path, logf=log):
         return {}
 
 
+def _opencode_managed():
+    """
+    Каталог «управляемого» конфига (для админов организации). OpenCode накладывает его
+    ПОВЕРХ пользовательского, то есть он главнее нашего, а прав на запись туда у нас нет.
+    Если там что-то лежит — можем только предупредить.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("ProgramData")
+        return os.path.join(base, "opencode") if base else None
+    if sys.platform == "darwin":
+        return "/Library/Application Support/opencode"
+    return "/etc/opencode"
+
+
+def _unhide_provider(cfg):
+    """
+    Снимает блокировки, из-за которых OpenCode не покажет провайдера, даже когда он
+    прописан правильно. Возвращает список того, что пришлось починить.
+
+    В схеме оба списка помечены deprecated, но пока действуют:
+      * enabled_providers — когда задан, включены ТОЛЬКО перечисленные, все остальные
+        игнорируются молча, без единого сообщения;
+      * disabled_providers — перечисленные выключены.
+    Сами мы эти ключи не ставим, так что сработает только у того, кто правил конфиг
+    руками или по чужому гайду. Это третья по частоте причина «провайдера не видно»
+    после неверного пути к конфигу и отсутствия limit у модели.
+    """
+    fixed = []
+    dis = cfg.get("disabled_providers")
+    if isinstance(dis, list) and OPENCODE_PROVIDER in dis:
+        cfg["disabled_providers"] = [x for x in dis if x != OPENCODE_PROVIDER]
+        fixed.append(f"«{OPENCODE_PROVIDER}» был в disabled_providers — убрал")
+    en = cfg.get("enabled_providers")
+    if isinstance(en, list) and OPENCODE_PROVIDER not in en:
+        cfg["enabled_providers"] = [*en, OPENCODE_PROVIDER]
+        fixed.append(f"задан enabled_providers без «{OPENCODE_PROVIDER}» — дописал, "
+                     f"иначе включены только перечисленные")
+    return fixed
+
+
+def _sync_v2_provider(cfg, url, key, title, ctx):
+    """
+    Если конфиг уже переехал на схему v2 (ключ `providers`), обновляем и её.
+
+    Сами такую секцию НЕ создаём. Формы нельзя смешивать: в v2-блоке с полем `npm`
+    OpenCode молча теряет и npm, и baseURL, и запуск падает на «Unsupported package»
+    (anomalyco/opencode#56816). Пишем v1-форму — её показывают официальные доки
+    провайдеров, и она работает. Но если OpenCode сам мигрировал наш блок, оставить
+    там прошлый адрес нельзя: `providers` — родной ключ v2, при расхождении победит он.
+
+    Старый v1-блок при этом не удаляем: после синхронизации оба несут одинаковые адрес
+    и ключ, так что чья бы форма ни победила при слиянии, результат верный. Удалить —
+    значит сломать конфиг тому, кто откатится на прошлую версию OpenCode.
+    """
+    v2 = cfg.get("providers")
+    prov = v2.get(OPENCODE_PROVIDER) if isinstance(v2, dict) else None
+    if not isinstance(prov, dict):
+        return False
+    prov["package"] = OPENCODE_PKG_V2
+    if title:
+        prov["name"] = f"{title} (Clore)"
+    settings = prov.setdefault("settings", {})
+    settings["baseURL"] = url
+    settings["apiKey"] = key
+    prov.pop("disabled", None)
+    # только поля, которые знает схема v2: лишние ключи она не переживает
+    prov["models"] = {
+        MODEL_NAME: {
+            "name": title or MODEL_NAME,
+            "limit": {"context": ctx, "output": max(4096, ctx // 4)},
+        }
+    }
+    return True
+
+
 def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
     """
     Прописывает провайдера во все конфиги OpenCode, какие есть в системе. Именно во все:
@@ -1036,7 +1119,12 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
         if os.path.isfile(local) and os.path.abspath(os.getcwd()) != os.path.abspath(HERE):
             logf(f"внимание: рядом с вами лежит {local} — OpenCode возьмёт провайдера "
                  f"оттуда, если запускать его в этом каталоге")
-    written = []
+    # управляемый конфиг накладывается поверх пользовательского, а записать туда нечем
+    managed = _opencode_managed()
+    if managed and any(os.path.isfile(os.path.join(managed, n)) for n in _OPENCODE_NAMES):
+        logf(f"внимание: есть управляемый конфиг в {managed} — он накладывается поверх "
+             f"вашего и может перекрыть провайдера. Правится только с правами админа")
+    written, unhidden, v2_synced = [], [], []
     for path in paths:
         cfg = {}
         if os.path.isfile(path):
@@ -1046,16 +1134,18 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-        prov = cfg.setdefault("provider", {}).setdefault("uncensored", {})
-        prov.setdefault("npm", "@ai-sdk/openai-compatible")
+        prov = cfg.setdefault("provider", {}).setdefault(OPENCODE_PROVIDER, {})
+        prov.setdefault("npm", OPENCODE_NPM)
         if title:
             prov["name"] = f"{title} (Clore)"
         opts = prov.setdefault("options", {})
         opts["baseURL"] = url
         opts["apiKey"] = key
+        prov.pop("disabled", None)      # мог остаться от прошлой правки руками
         # Без секции models OpenCode не показывает провайдера вообще: baseURL и ключ он
         # принимает, но список моделей не запрашивает — их надо перечислить явно.
         # Идентификатор здесь тот же, под которым модель отдаёт сам движок.
+        # limit обязателен: без context и output кастомный провайдер падает на валидации.
         prov["models"] = {
             MODEL_NAME: {
                 "name": title or MODEL_NAME,
@@ -1063,6 +1153,12 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
                 "tool_call": True,
             }
         }
+        # мало прописать провайдера — надо ещё снять то, что его прячет
+        for msg in _unhide_provider(cfg):
+            if msg not in unhidden:
+                unhidden.append(msg)
+        if _sync_v2_provider(cfg, url, key, title, ctx):
+            v2_synced.append(path)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -1077,8 +1173,12 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
     logf(f"OpenCode переключён — его основной конфиг: {written[0]}")
     if len(written) > 1:
         logf("заодно обновлены другие найденные копии: " + ", ".join(written[1:]))
-    logf("если модели не видно: перезапустите OpenCode, а в списке ищите провайдера "
-         "«uncensored»")
+    for msg in unhidden:
+        logf("провайдер был скрыт настройками: " + msg)
+    if v2_synced:
+        logf("конфиг на схеме v2 — секция providers обновлена тоже: " + ", ".join(v2_synced))
+    logf(f"перезапустите OpenCode: провайдер «{OPENCODE_PROVIDER}», "
+         f"модель «{OPENCODE_PROVIDER}/{MODEL_NAME}»")
     return True
 
 
