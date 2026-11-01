@@ -100,7 +100,10 @@ async function loadState() {
     if (!input) continue;
     if (v.set && input.type === 'password') input.placeholder = `сохранён (${v.hint}) — пусто = не менять`;
     else if (!v.set && input.type === 'password') input.placeholder = 'не задан';
-    if (input.type !== 'password' && v.value) input.value = v.value;
+    // Обычное поле показывает ровно то, что лежит в .env, включая пустоту. Раньше
+    // пустое значение поле не трогало, и после очистки оно могло показывать старое —
+    // то есть расходиться с тем, что реально применяется при деплое.
+    if (input.type !== 'password') input.value = v.value || '';
   }
 
   renderCurrent();
@@ -660,20 +663,39 @@ async function cancelOrder(order) {
 }
 
 // ───────── настройки ─────────
+// Список полей берём из ответа сервера, а не из записанного здесь перечня: раньше он был
+// захардкожен пятью ключами, и EXCLUDE_HOSTS в него не попал — поле показывало значение
+// из .env, но при сохранении не отправлялось никогда, то есть было декоративным.
+// Второе: пустое значение раньше отбрасывалось целиком. Для секретов это правильно
+// (показать их нечем, поэтому пусто = «не менять»), а для обычных полей пустота — это
+// значение: именно так очищают список исключённых регионов.
 async function saveSettings() {
   const body = {};
-  ['CLORE_API_KEY', 'API_KEY', 'HF_TOKEN', 'TG_BOT_TOKEN', 'TG_CHAT_ID'].forEach((k) => {
-    const v = $('s-' + k).value.trim();
-    if (v) body[k] = v;
-  });
-  if (!Object.keys(body).length) return toast('нечего сохранять', true);
+  let changed = false;
+  for (const [k, meta] of Object.entries(state.env?.settings || {})) {
+    const input = $('s-' + k);
+    if (!input) continue;                       // ключ есть на сервере, но поля в UI нет
+    const v = input.value.trim();
+    // Тип поля — источник правды наравне с флагом сервера. Если страницу обновили, а
+    // app.py ещё старый, флага в ответе нет, и без этой страховки все ключи ушли бы
+    // как обычные поля, то есть сохранились бы пустыми — с потерей API-ключей.
+    if (input.type === 'password' || meta.secret) {
+      if (v) { body[k] = v; changed = true; }
+    } else {
+      body[k] = v;
+      if (v !== (meta.value || '')) changed = true;
+    }
+  }
+  if (!changed) return toast('нечего сохранять', true);
   busy($('btn-save'), true, 'сохраняю…');
   try {
     const r = await api('/api/settings', body);
-    Object.keys(body).forEach((k) => ($('s-' + k).value = ''));
+    // чистим только поля-пароли: остальные показывают текущее значение, и стирать его
+    // после сохранения нельзя — иначе очищенным выглядит то, что мы только что записали
+    Object.keys(body).forEach((k) => { if ($('s-' + k).type === 'password') $('s-' + k).value = ''; });
     $('save-note').textContent = 'сохранено: ' + r.saved.join(', ');
     await loadState();
-    toast('ключи записаны в .env');
+    toast('настройки записаны в .env');
   } catch (e) { toast(e.message, true); }
   finally { busy($('btn-save'), false); }
 }

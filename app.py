@@ -86,7 +86,10 @@ def env_state():
     settings = {}
     for k, secret in SETTING_KEYS.items():
         val = env.get(k) or ""
-        settings[k] = {"set": bool(val), "value": "" if secret and val else val,
+        # secret нужен и UI: у секретов пустое поле означает «не менять» (показать их
+        # нечем), у обычных пустота — это значение, и его надо уметь сохранить
+        settings[k] = {"set": bool(val), "secret": secret,
+                       "value": "" if secret and val else val,
                        "hint": (val[:4] + "…" + val[-4:]) if secret and len(val) > 10 else ""}
     api_url = env.get("API_URL") or ""
     alive = bool(api_url and env.get("API_KEY") and deploy.api_alive(api_url, env["API_KEY"], timeout=4))
