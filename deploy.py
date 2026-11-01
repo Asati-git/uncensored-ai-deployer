@@ -1445,13 +1445,26 @@ def deploy(cfg, env=None, logf=log):
         api_timeout = max(API_TIMEOUT, int(offer.get("download_hours", 0) * 3600 * 2.5) + 30 * 60)
         if api_timeout > API_TIMEOUT:
             logf(f"модель большая — жду до {api_timeout // 60} мин вместо {API_TIMEOUT // 60}")
-        if not wait_api(api_url, api_key, logf, timeout=api_timeout,
-                        ssh_host=host, ssh_port=acc["ports"].get(22, 22),
-                        total_gib=info.get("weights_gib"),
-                        status_port=acc["ports"].get(STATUS_PORT)):
+        # Сравниваем именно с «ready». Тут стояло `if not wait_api(...)`, а функция
+        # возвращает строку: и "ready", и "slow", и "stalled" — непустые, то есть
+        # истинные. Ветка отказа не исполнялась ни разу с самого первого коммита:
+        # любой деплой рапортовал успех, прописывал мёртвый адрес в OpenCode и не слал
+        # ни одного предупреждения в Telegram. Снаружи это выглядело как «✅ модель
+        # готова» сразу после «⛔ за 30 мин ничего не изменилось».
+        outcome = wait_api(api_url, api_key, logf, timeout=api_timeout,
+                           ssh_host=host, ssh_port=acc["ports"].get(22, 22),
+                           total_gib=info.get("weights_gib"),
+                           status_port=acc["ports"].get(STATUS_PORT))
+        if outcome == "slow":
+            # канал оказался в разы медленнее заявленного — сервер негодный,
+            # его не разбирают, а меняют на следующего кандидата
+            drop_server(clore, oid, sid, "скачивание в разы медленнее заявленного", logf)
+            continue
+        if outcome != "ready":
             tg(env, f"⛔ Заказ {oid}: деплой остановлен — прогресс встал более чем на "
                     f"{STALL_TIMEOUT // 60} мин (или вышел общий лимит {api_timeout // 60} мин). "
                     f"Сервер оставлен для разбора: {ssh}\nЛоги: /root/deploy.log, /root/download.log, /root/engine.log")
+            logf(f"⛔ деплой не удался ({outcome}). Сервер оставлен для разбора: {ssh}")
             return {"status": "timeout", "order": oid, "api_url": api_url, "ssh": ssh}
 
         speed = bench(api_url, api_key)
