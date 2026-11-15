@@ -175,6 +175,9 @@ def load_env():
 
 
 def save_env_keys(updates: dict):
+    # Значение — всегда одна строка. Перевод строки внутри него дописал бы в .env
+    # посторонний ключ: так через поле настроек подменялся бы, например, API_URL.
+    updates = {k: re.sub(r"[\r\n]+", " ", str(v)).strip() for k, v in updates.items()}
     lines, seen = [], set()
     if os.path.exists(ENV_PATH):
         with open(ENV_PATH, encoding="utf-8") as f:

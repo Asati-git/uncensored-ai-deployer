@@ -47,6 +47,12 @@ JOB_LOCK = threading.Lock()
 # останавливается, а не арендует следующий сервер вместо «неподнявшегося».
 JOB_STOP = threading.Event()
 
+# Имена, под которыми UI открывают законно. Запрос с любым другим Host — это чужая
+# страница, дотянувшаяся до локального порта (DNS rebinding), а не наш интерфейс.
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+ALLOWED_HOSTS = set(LOCAL_HOSTS)
+OPEN_BIND = False     # слушаем все интерфейсы: имя хоста заранее неизвестно
+
 
 # ---------- фоновая задача деплоя ----------
 def job_log(msg):
@@ -243,6 +249,10 @@ def api_post(path, body):
 
     if path == "/api/settings":
         updates = {k: str(v).strip() for k, v in (body or {}).items() if k in SETTING_KEYS}
+        # перевод строки внутри значения дописал бы в .env посторонний ключ
+        bad = sorted(k for k, v in updates.items() if "\n" in v or "\r" in v)
+        if bad:
+            raise ValueError("значение должно быть одной строкой: " + ", ".join(bad))
         if updates:
             deploy.save_env_keys(updates)
         return {"ok": True, "saved": sorted(updates)}
@@ -406,7 +416,40 @@ class Handler(BaseHTTPRequestHandler):
         ext = os.path.splitext(full)[1].lower()
         self._send(200, raw=data, ctype=CONTENT_TYPES.get(ext, "application/octet-stream"))
 
+    def _foreign(self, post=False):
+        """
+        Причина, по которой запрос пришёл не от нашего UI, либо None.
+
+        Сервер слушает локальный порт, но браузер пускает к нему любую открытую страницу:
+        без этих проверок посторонний сайт мог запустить аренду, отменить заказ или
+        переписать ключи в .env, а через DNS rebinding — ещё и прочитать лог деплоя.
+          * Host — отсекает rebinding: чужой домен, указывающий на 127.0.0.1;
+          * Origin / Sec-Fetch-Site — отсекают запросы со страниц других сайтов;
+          * Content-Type — JSON с чужой страницы требует preflight, который мы не
+            разрешаем; «простой» text/plain прошёл бы без него.
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = urllib.parse.urlsplit("//" + host).hostname or ""
+        if not OPEN_BIND and name not in ALLOWED_HOSTS:
+            return f"недопустимый Host: {host or 'пусто'}"
+        if not post and not self.path.startswith("/api/"):
+            # статика: переход по ссылке с другого сайта — обычное дело, а секретов в ней нет
+            return None
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        if origin and urllib.parse.urlsplit(origin).netloc != host:
+            return "запрос с другого сайта"
+        if (self.headers.get("Sec-Fetch-Site") or "").lower() in ("cross-site", "same-site"):
+            return "запрос с другого сайта"
+        if post:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return "ожидался Content-Type: application/json"
+        return None
+
     def do_GET(self):
+        why = self._foreign()
+        if why:
+            return self._send(403, {"error": why})
         parsed = urllib.parse.urlparse(self.path)
         if not parsed.path.startswith("/api/"):
             return self._static(parsed.path)
@@ -423,6 +466,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"{e.__class__.__name__}: {e}"})
 
     def do_POST(self):
+        why = self._foreign(post=True)
+        if why:
+            return self._send(403, {"error": why})
         parsed = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         try:
@@ -451,6 +497,17 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
+
+    global OPEN_BIND
+    bind = args.host.strip("[]").lower()
+    if bind in ("0.0.0.0", "::", ""):
+        # имя, под которым придут из сети, заранее неизвестно — Host проверить нечем;
+        # проверки Origin и Content-Type остаются
+        OPEN_BIND = True
+        print("⚠️ UI слушает все интерфейсы: он доступен из сети без пароля, "
+              "а в нём ключи и аренда за деньги", flush=True)
+    else:
+        ALLOWED_HOSTS.add(bind)
 
     url = f"http://{args.host}:{args.port}/"
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
