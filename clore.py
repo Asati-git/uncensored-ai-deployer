@@ -24,6 +24,10 @@ PRICE_PERIOD_HOURS = 24    # Clore публикует цены за сутки, 
 # частота вызовов: path -> минимальный интервал в секундах
 RATE_LIMITS = {"create_order": 5.0}
 DEFAULT_RATE = 1.1
+# Запросы, которые нельзя повторять вслепую. Если create_order дошёл до Clore, а ответ
+# потерялся, повтор получит «сервер уже арендован» — нами же: деплой уйдёт к следующему
+# серверу, а первый заказ останется тарифицироваться без единой ссылки на него.
+NON_IDEMPOTENT = {"create_order"}
 
 _ERRORS = {
     1: "общая ошибка API",
@@ -46,9 +50,12 @@ _DETAILS = {
 
 
 class CloreError(RuntimeError):
-    def __init__(self, code, detail=None):
+    def __init__(self, code, detail=None, uncertain=False):
         self.code = code
         self.detail = detail
+        # True — неизвестно, выполнился ли запрос: ответ не дошёл. Для create_order это
+        # значит, что заказ мог создаться, и вызывающий обязан проверить это сам.
+        self.uncertain = uncertain
         msg = _ERRORS.get(code, f"код ответа {code}")
         if detail:
             msg += f" ({_DETAILS.get(str(detail), detail)})"
@@ -84,6 +91,7 @@ class Clore:
         if data:
             headers["Content-Type"] = "application/json"
 
+        safe = path not in NON_IDEMPOTENT
         for attempt in range(retries):
             self._throttle(path)
             req = urllib.request.Request(url, data=data, headers=headers,
@@ -93,17 +101,20 @@ class Clore:
                     out = json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
                 payload = e.read().decode(errors="replace")[:300]
-                if e.code in (429, 502, 503, 504) and attempt < retries - 1:
+                gateway = e.code in (502, 503, 504)
+                # 429 — запрос отвергнут, повторять можно всегда. Ошибка шлюза не говорит,
+                # дошёл ли запрос до бэкенда, поэтому create_order на ней не повторяем
+                if (e.code == 429 or (gateway and safe)) and attempt < retries - 1:
                     # 429 прилетает, когда к аккаунту обращаются сразу несколько деплоев;
                     # пауза по секунде тут не помогает — ждём ощутимо дольше
                     time.sleep((5 if e.code == 429 else 1) * (2 ** attempt))
                     continue
-                raise CloreError(1, f"HTTP {e.code}: {payload}")
+                raise CloreError(1, f"HTTP {e.code}: {payload}", uncertain=gateway and not safe)
             except (urllib.error.URLError, TimeoutError) as e:
-                if attempt < retries - 1:
+                if safe and attempt < retries - 1:
                     time.sleep(2 ** attempt)
                     continue
-                raise CloreError(1, f"сеть: {e}")
+                raise CloreError(1, f"сеть: {e}", uncertain=not safe)
 
             code = out.get("code", 0)
             if code == 5 and attempt < retries - 1:

@@ -64,6 +64,9 @@ SCRIPTS = {
 # медленный хост проигрывает сам — отсекаем только совсем безнадёжные.
 MIN_NET_DOWN_MBPS = 200
 TRY_OFFERS = 5                  # сколько кандидатов показываем и столько же реально пробуем
+# Сколько серверов можно выбрать руками. Выбранные образуют очередь: не поднялся первый —
+# деплой идёт ко второму и так далее, не возвращаясь к автоподбору.
+MAX_PICK_SERVERS = 10
 # Доля удачных аренд по версии Clore. У большинства хостов она 0.999, но примерно у каждого
 # шестого ниже 0.9 — и именно там контейнер поднимается криво (например, вовсе без sshd).
 # Экономия в пару центов в час того не стоит.
@@ -493,6 +496,26 @@ def gpu_matches(query, brief):
     return all(t in hay for t in terms)
 
 
+def picked_servers(cfg):
+    """
+    Выбранные вручную серверы в порядке выбора — это очередь попыток, а не список
+    равноправных вариантов: первый не поднялся, берём второй. Принимает и server_ids
+    (список из UI, строка с запятыми из CLI), и одиночный server_id старого формата.
+    """
+    raw = cfg.get("server_ids") or cfg.get("server_id") or []
+    if isinstance(raw, (str, int)):
+        raw = re.split(r"[\s,]+", str(raw))
+    out = []
+    for v in raw:
+        try:
+            sid = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue
+        if sid > 0 and sid not in out:   # повтор в очереди бессмыслен
+            out.append(sid)
+    return out[:MAX_PICK_SERVERS]
+
+
 def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=None,
                 gpu_filter=None, order_type="on-demand", min_net=MIN_NET_DOWN_MBPS,
                 download_gib=0, limit=25, engine=None, quant=None, allow_old_gpu=False,
@@ -676,10 +699,11 @@ def pick_currency(offer, balances, rates, forced=None):
     return (held or ranked)[0]
 
 
-def wait_order_ready(clore, order_id, logf=log, timeout=ORDER_TIMEOUT):
+def wait_order_ready(clore, order_id, logf=log, timeout=ORDER_TIMEOUT, stop=None):
     """Ждёт, пока у заказа появятся адрес и проброшенные порты."""
     t0 = time.time()
     while time.time() - t0 < timeout:
+        check_stop(stop)
         try:
             o = clore.order(order_id)
         except CloreError as e:
@@ -809,21 +833,67 @@ def wait_sshd(host, port, timeout=600):
     return False
 
 
-def drop_server(clore, order_id, server_id, reason, logf=log, **extra):
+class DeployStopped(Exception):
+    """Деплой прерван снаружи: заказ отменили руками, пока он поднимался."""
+
+
+def check_stop(stop):
+    """stop — функция без аргументов; истина означает «заказ отменён, дальше не идём»."""
+    if stop and stop():
+        raise DeployStopped("деплой остановлен: заказ отменён вручную")
+
+
+def cancel_order_safe(clore, order_id, reason=None, logf=log, attempts=4, pause=10):
+    """
+    Отменяет заказ и возвращает None, когда он точно больше не тарифицируется: отмена
+    прошла либо заказа уже нет среди активных (Clore гасит их и сам). Иначе возвращает
+    последнюю ошибку — и тогда ссылку на заказ стирать НЕЛЬЗЯ: он продолжает списывать
+    деньги, а без номера в .env его не найдёт ни UI, ни stop.py.
+    """
+    err = None
+    for n in range(attempts):
+        try:
+            clore.cancel_order(order_id, reason)
+            return None
+        except CloreError as e:
+            err = e
+        try:
+            order = clore.order(order_id)
+            if order is None or order.get("expired"):
+                logf(f"заказ {order_id} уже неактивен на стороне Clore — отменять нечего")
+                return None
+        except CloreError:
+            pass
+        if n < attempts - 1:
+            logf(f"отмена заказа {order_id} не прошла ({err}) — повтор {n + 1}/{attempts - 1}")
+            time.sleep(pause)
+    return err
+
+
+def cancel_or_halt(clore, env, order_id, reason, logf=log):
+    """
+    Отмена перед переходом к следующему серверу. Не получилось — деплой останавливается:
+    арендовать второй сервер, пока первый ещё оплачивается, нельзя.
+    """
+    err = cancel_order_safe(clore, order_id, reason[:64], logf)
+    if err is None:
+        return
+    msg = (f"заказ {order_id} не удалось отменить ({err}) — он продолжает оплачиваться. "
+           f"Номер оставлен в .env: отмените его кнопкой «Отменить заказ» или stop.py. "
+           f"К следующему серверу не перехожу")
+    tg(env, "⛔ " + msg)
+    raise SystemExit(msg)
+
+
+def drop_server(clore, env, order_id, server_id, reason, logf=log, **extra):
     """Отменить заказ, занести сервер в чёрный список и очистить состояние в .env."""
     logf(f"⛔ сервер {server_id}: {reason} — отменяю заказ {order_id} и беру другой")
-    for _ in range(3):
-        try:
-            clore.cancel_order(order_id, reason[:64])
-            break
-        except CloreError as e:
-            logf(f"отмена не прошла ({e}) — повтор")
-            time.sleep(10)
     blacklist_add(server_id, reason, **extra)
+    cancel_or_halt(clore, env, order_id, reason, logf)
     save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
 
 
-def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT):
+def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT, stop=None):
     """
     Подал ли контейнер хоть какой-то признак жизни: ssh, статус-порт или уже готовый API.
     У здорового хоста Clore это происходит за минуту-две. Молчание дольше limit означает,
@@ -832,6 +902,7 @@ def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT):
     """
     t0, noted = time.time(), 0
     while time.time() - t0 < limit:
+        check_stop(stop)
         el = int(time.time() - t0)
         if el - noted >= 60:      # иначе первые пять минут деплой выглядит зависшим
             logf(f"жду отклика контейнера… {el // 60} мин из {limit // 60}")
@@ -847,7 +918,7 @@ def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT):
 
 
 def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=None,
-             total_gib=None, status_port=None, net_mbps=None):
+             total_gib=None, status_port=None, net_mbps=None, stop=None):
     """
     Ждёт готовности модели. Возвращает "ready" / "stalled" / "slow".
 
@@ -863,6 +934,7 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
     last_text, last_change, seen = None, time.time(), False
     mark = None                      # (время, байт) — точка отсчёта для замера скорости
     while time.time() - t0 < timeout:
+        check_stop(stop)
         if api_alive(url, key):
             return "ready"
         el = int(time.time() - t0)
@@ -1185,7 +1257,8 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
 # ---------- главный сценарий ----------
 def deploy(cfg, env=None, logf=log):
     """
-    cfg: model (ссылка/repo_id), ctx, max_price, currency, order_type, server_id,
+    cfg: model (ссылка/repo_id), ctx, max_price, currency, order_type, server_ids
+         (очередь выбранных вручную серверов; одиночный server_id тоже принимается),
          gpu_filter, image, gguf_file, force, dry_run, ssh_password
     Возвращает dict с результатом; бросает SystemExit/CloreError при фатальной ошибке.
     """
@@ -1255,17 +1328,35 @@ def deploy(cfg, env=None, logf=log):
                          allow_old_gpu=bool(cfg.get("allow_old_gpu")),
                          balance_usd=bal_usd or None, spread=bool(cfg.get("spread")),
                          need_ram=need_ram, cpu_moe=cpu_moe)
-    if cfg.get("server_id"):
-        sid = int(cfg["server_id"])
-        offers = [o for o in offers if int(o["id"]) == sid] or \
-                 find_offers(clore, 0, 0, None, forced_currency, None, order_type,
-                             min_net=0, download_gib=info["weights_gib"], limit=10_000,
-                             engine=info["engine"], quant=info.get("precision"),
-                             allow_old_gpu=True)
-        offers = [o for o in offers if int(o["id"]) == sid]
+    picked = picked_servers(cfg)
+    if picked:
+        known = {int(o["id"]): o for o in offers}
+        if not all(sid in known for sid in picked):
+            # Выбранный руками сервер мог не пройти фильтры подбора (мало VRAM под этот
+            # квант, медленная сеть, чёрный список) — ищем такие отдельно, без ограничений
+            wide = find_offers(clore, 0, 0, None, forced_currency, None, order_type,
+                               min_net=0, download_gib=info["weights_gib"], limit=10_000,
+                               engine=info["engine"], quant=info.get("precision"),
+                               allow_old_gpu=True)
+            for o in wide:
+                if int(o["id"]) in picked:
+                    known.setdefault(int(o["id"]), o)
+        gone = [sid for sid in picked if sid not in known]
+        if gone:
+            logf("не нашлись в маркетплейсе (заняты или сняты с продажи): "
+                 + ", ".join(str(s) for s in gone))
+        # порядок — тот, в котором серверы выбирали в UI: это очередь аренды, а не цены
+        offers = [known[sid] for sid in picked if sid in known]
         for o in offers:
             if not o.get("gpu_ok"):
-                logf(f"⚠️ сервер {sid} выбран вручную, но {o['gpu_note']}")
+                logf(f"⚠️ сервер {o['id']} выбран вручную, но {o['gpu_note']}")
+    if not offers and picked:
+        msg = ("ни один из выбранных серверов недоступен: "
+               + ", ".join(str(s) for s in picked)
+               + ". Их успели арендовать или хост снял их с продажи — "
+                 "обновите список на вкладке «Сервер» и выберите другие")
+        tg(env, "⛔ " + msg)
+        raise SystemExit(msg)
     if not offers:
         ceiling = bal_usd or 0
         msg = (f"на Clore нет подходящих серверов: нужно ≥{info['vram_gib']} GiB VRAM, "
@@ -1280,12 +1371,18 @@ def deploy(cfg, env=None, logf=log):
         tg(env, "⛔ " + msg)
         raise SystemExit(msg)
 
-    for o in offers[:TRY_OFFERS]:
-        logf(f"кандидат {o['id']}: {o['gpu_count']}x {o['gpu']}"
+    # Выбранные руками серверы пробуем все: это и есть очередь, которую задал пользователь.
+    # Автоподбору хватает пяти лучших — дальше по списку цена растёт быстрее, чем шансы.
+    candidates = offers if picked else offers[:TRY_OFFERS]
+    if picked and len(candidates) > 1:
+        logf(f"очередь аренды из {len(candidates)} серверов — пробую по порядку, "
+             f"пока один не поднимется")
+    for n, o in enumerate(candidates, 1):
+        logf(f"кандидат {n}: {o['id']} — {o['gpu_count']}x {o['gpu']}"
              f"{' (' + o['arch'] + ')' if o.get('arch') else ''} ({o['vram_gb']} GiB VRAM) "
              f"${o['price_used']:.3f}/ч, диск {o['disk_gb']} GB, {o['net_down']:.0f} Mbps")
     if cfg.get("dry_run"):
-        return {"status": "dry-run", "model": info, "offers": offers}
+        return {"status": "dry-run", "model": info, "offers": candidates}
 
     script, order_env = render_onstart(info, env, ctx=info["ctx"], gguf_file=cfg.get("gguf_file"))
     command = build_command(script)
@@ -1300,10 +1397,16 @@ def deploy(cfg, env=None, logf=log):
     else:
         logf(f"публичного ключа нет, вход по паролю: {ssh_password}")
 
+    # Заказ могут отменить руками, пока он поднимается. Без этой проверки деплой принимал
+    # отменённый сервер за неподнявшийся и молча арендовал следующего кандидата.
+    stop = cfg.get("stop")
     tried = 0
-    for offer in offers[:TRY_OFFERS]:
+    for offer in candidates:
+        check_stop(stop)
         tried += 1
         sid = offer["id"]
+        if len(candidates) > 1:
+            logf(f"— попытка {tried} из {len(candidates)}: сервер {sid}")
         currency, amount, usd = pick_currency(offer, balances, rates, forced_currency)
         if not amount:
             logf(f"сервер {sid}: нет цены в валюте {currency} — беру следующий")
@@ -1362,13 +1465,23 @@ def deploy(cfg, env=None, logf=log):
                 required_price=amount,
             )
         except CloreError as e:
-            logf(f"сервер {sid}: {e} — беру следующий")
-            # HTTP 500 не зависит от сервера (чаще всего слишком длинная команда заказа) —
-            # перебирать остальных кандидатов бессмысленно, только плодим мусорные попытки
-            if getattr(e, "code", None) == 1 and "HTTP 500" in str(e):
-                raise SystemExit("Clore отвечает HTTP 500 на создание заказа — проблема не "
-                                 "в сервере. Чаще всего это слишком длинная команда заказа")
-            continue
+            if getattr(e, "uncertain", False):
+                # Ответ не дошёл, а запрос мог: заказ, возможно, создан и уже
+                # тарифицируется. Не уходим к следующему серверу, а ищем его ниже.
+                logf(f"сервер {sid}: {e} — ответ Clore не получен, проверяю, "
+                     f"не создался ли заказ")
+                unsure = True
+            else:
+                logf(f"сервер {sid}: {e} — беру следующий")
+                # HTTP 500 не зависит от сервера (чаще всего слишком длинная команда
+                # заказа) — перебирать остальных кандидатов бессмысленно
+                if getattr(e, "code", None) == 1 and "HTTP 500" in str(e):
+                    raise SystemExit("Clore отвечает HTTP 500 на создание заказа — проблема "
+                                     "не в сервере. Чаще всего это слишком длинная команда "
+                                     "заказа")
+                continue
+        else:
+            unsure = False
 
         # Заказ уже создан и тарифицируется. Любая сетевая ошибка дальше не должна
         # оставить его сиротой: записываем номер сервера в .env сразу, ещё до опроса,
@@ -1390,24 +1503,32 @@ def deploy(cfg, env=None, logf=log):
                 save_env_keys({"ORDER": str(found["id"])})
                 break
             time.sleep(POLL)
-        if not found:
-            logf(f"⚠️ заказ на сервер {sid} создан, но не появился в my_orders. "
-                 f"Он может тарифицироваться: проверьте вкладку «Заказы» и отмените вручную")
+        if not found and unsure:
+            # за две минуты заказ так и не появился — значит, запрос до Clore не дошёл
+            logf(f"сервер {sid}: заказ не создался — беру следующий")
+            save_env_keys({"SERVER": ""})
             continue
+        if not found:
+            # Clore подтвердил создание, но заказа в списке нет. Идти дальше нельзя:
+            # он может тарифицироваться, и следующий сервер стал бы вторым оплачиваемым.
+            msg = (f"заказ на сервер {sid} создан, но не появился в списке заказов. Он может "
+                   f"тарифицироваться: проверьте вкладку «Заказы» и отмените его вручную. "
+                   f"К следующему серверу не перехожу")
+            tg(env, "⛔ " + msg)
+            raise SystemExit(msg)
 
         oid = found["id"]
+        check_stop(stop)
         logf(f"заказ {oid} создан на сервере {sid}")
         tg(env, f"🚀 Clore: заказ {oid}, {offer['gpu_count']}x {offer['gpu']} "
                 f"({offer['vram_gb']} GiB VRAM), ${usd:.3f}/ч (списание {amount:g} {currency}).\n"
                 f"Ставлю {info['engine']} и качаю {info['repo_id']} ({info['weights_gib']} GiB).")
 
-        ready = wait_order_ready(clore, oid, logf)
+        ready = wait_order_ready(clore, oid, logf, stop=stop)
         if not ready:
             logf(f"заказ {oid} не выдал адрес за {ORDER_TIMEOUT // 60} мин — отменяю")
-            try:
-                clore.cancel_order(oid, "сервер не стартовал")
-            except CloreError as e:
-                logf(f"отмена не удалась: {e}")
+            cancel_or_halt(clore, env, oid, "сервер не стартовал", logf)
+            save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
             continue
 
         order, acc = ready
@@ -1417,13 +1538,7 @@ def deploy(cfg, env=None, logf=log):
         if hit:
             logf(f"сервер {sid} оказался в исключённом регионе ({host} содержит «{hit}») — "
                  f"отменяю заказ {oid} и беру следующий")
-            for _ in range(3):
-                try:
-                    clore.cancel_order(oid)
-                    break
-                except CloreError as e:
-                    logf(f"отмена не прошла ({e}) — повтор")
-                    time.sleep(10)
+            cancel_or_halt(clore, env, oid, "исключённый регион", logf)
             save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
             continue
         api_url = f"http://{host}:{acc['ports'][API_PORT]}/v1"
@@ -1433,9 +1548,9 @@ def deploy(cfg, env=None, logf=log):
                        "CTX": str(fit_ctx), "ENGINE": info["engine"]})
         logf(f"контейнер поднят. API будет на {api_url}; {ssh} (пароль: {ssh_password})")
 
-        sign = wait_alive(host, acc["ports"], api_url, api_key, logf)
+        sign = wait_alive(host, acc["ports"], api_url, api_key, logf, stop=stop)
         if not sign:
-            drop_server(clore, oid, sid,
+            drop_server(clore, env, oid, sid,
                         f"контейнер молчал {SILENT_LIMIT // 60} мин после аренды", logf)
             continue
         logf(f"сервер отвечает ({sign})")
@@ -1454,17 +1569,23 @@ def deploy(cfg, env=None, logf=log):
         outcome = wait_api(api_url, api_key, logf, timeout=api_timeout,
                            ssh_host=host, ssh_port=acc["ports"].get(22, 22),
                            total_gib=info.get("weights_gib"),
-                           status_port=acc["ports"].get(STATUS_PORT))
+                           status_port=acc["ports"].get(STATUS_PORT), stop=stop)
         if outcome == "slow":
             # канал оказался в разы медленнее заявленного — сервер негодный,
             # его не разбирают, а меняют на следующего кандидата
-            drop_server(clore, oid, sid, "скачивание в разы медленнее заявленного", logf)
+            drop_server(clore, env, oid, sid, "скачивание в разы медленнее заявленного", logf)
             continue
         if outcome != "ready":
             tg(env, f"⛔ Заказ {oid}: деплой остановлен — прогресс встал более чем на "
                     f"{STALL_TIMEOUT // 60} мин (или вышел общий лимит {api_timeout // 60} мин). "
                     f"Сервер оставлен для разбора: {ssh}\nЛоги: /root/deploy.log, /root/download.log, /root/engine.log")
             logf(f"⛔ деплой не удался ({outcome}). Сервер оставлен для разбора: {ssh}")
+            # Очередь дальше не идём намеренно: заказ живой и тарифицируется, а второй
+            # сервер означал бы оплату двух сразу. Решение — за пользователем
+            if tried < len(candidates):
+                logf(f"остальные {len(candidates) - tried} серверов очереди не трогаю: "
+                     f"этот заказ ещё оплачивается. Отмените его и запустите деплой заново, "
+                     f"если хотите попробовать следующий")
             return {"status": "timeout", "order": oid, "api_url": api_url, "ssh": ssh}
 
         speed = bench(api_url, api_key)
@@ -1520,7 +1641,9 @@ def main():
                     choices=["auto"] + CURRENCIES,
                     help="валюта списания с баланса Clore; auto — самая дешёвая из доступных")
     ap.add_argument("--order-type", default="on-demand", choices=["on-demand", "spot"])
-    ap.add_argument("--server", type=int, help="арендовать конкретный сервер Clore по id")
+    ap.add_argument("--server", help=f"арендовать конкретные серверы Clore по id; через "
+                                     f"запятую можно указать до {MAX_PICK_SERVERS} — они "
+                                     f"образуют очередь: не поднялся первый, берём следующий")
     ap.add_argument("--gpu", help="фильтр по названию GPU, например 4090")
     ap.add_argument("--gguf-file", help="какой квант брать из GGUF-репозитория "
                                         "(путь внутри репозитория; по умолчанию Q4_K_M)")
@@ -1548,7 +1671,7 @@ def main():
         raise SystemExit("в .env нет CLORE_API_KEY — задайте его в UI (ui.bat) или вручную")
     res = deploy({"model": args.model, "ctx": args.ctx, "max_price_usd": args.max_price,
                   "currency": args.currency, "order_type": args.order_type,
-                  "server_id": args.server, "gpu_filter": args.gpu, "image": args.image,
+                  "server_ids": args.server, "gpu_filter": args.gpu, "image": args.image,
                   "gguf_file": args.gguf_file, "skip_opencode": args.no_opencode,
                   "allow_old_gpu": args.allow_old_gpu, "spread": args.spread,
                   "cpu_moe": args.cpu_moe,

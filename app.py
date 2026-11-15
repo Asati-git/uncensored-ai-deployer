@@ -43,6 +43,9 @@ SETTING_KEYS = {
 
 JOB = {"running": False, "log": [], "result": None, "error": None, "started": None, "title": None}
 JOB_LOCK = threading.Lock()
+# Поднимается, когда заказ идущего деплоя отменили из UI: поток деплоя видит флаг и
+# останавливается, а не арендует следующий сервер вместо «неподнявшегося».
+JOB_STOP = threading.Event()
 
 
 # ---------- фоновая задача деплоя ----------
@@ -60,6 +63,8 @@ def run_deploy(cfg):
             raise RuntimeError("деплой уже идёт")
         JOB.update(running=True, log=[], result=None, error=None,
                    started=time.time(), title=cfg.get("model"))
+    JOB_STOP.clear()
+    cfg = {**cfg, "stop": JOB_STOP.is_set}
 
     def worker():
         try:
@@ -67,6 +72,11 @@ def run_deploy(cfg):
             with JOB_LOCK:
                 JOB["result"] = res
             job_log("задача завершена: " + str(res.get("status")))
+        except deploy.DeployStopped as e:
+            # не ошибка: заказ отменил сам пользователь, и деплой послушно встал
+            with JOB_LOCK:
+                JOB["result"] = {"status": "stopped"}
+            job_log(f"⏹ {e}. Очередь серверов дальше не идёт")
         except BaseException as e:  # noqa
             with JOB_LOCK:
                 JOB["error"] = str(e) or e.__class__.__name__
@@ -284,7 +294,9 @@ def api_post(path, body):
             "max_price_usd": float(body["max_price"]) if body.get("max_price") else None,
             "currency": body.get("currency") or "auto",   # валюта списания; USD — только отображение
             "order_type": body.get("order_type") or "on-demand",
-            "server_id": int(body["server_id"]) if body.get("server_id") else None,
+            # очередь серверов из UI: не поднялся первый — деплой идёт ко второму.
+            # Одиночный server_id остаётся ради старых вызовов API
+            "server_ids": deploy.picked_servers(body),
             "gpu_filter": (body.get("gpu_filter") or "").strip() or None,
             "image": (body.get("image") or "").strip() or None,
             "gguf_file": (body.get("gguf_file") or "").strip() or None,
@@ -307,9 +319,27 @@ def api_post(path, body):
         oid = body.get("order") or env.get("ORDER")
         if not oid:
             raise ValueError("не указан заказ")
-        Clore(env.get("CLORE_API_KEY")).cancel_order(int(oid), body.get("issue"))
-        if str(oid) == str(env.get("ORDER")):
-            deploy.save_env_keys({"ORDER": "", "API_URL": "", "SSH": ""})
+        # Заказ мог погаснуть сам (Clore гасит его, когда контейнер завершился). Тогда
+        # cancel_order отвечает ошибкой, и раньше на этом всё заканчивалось: карточка
+        # «Текущий сервер» продолжала показывать мёртвый заказ, и убрать её было нечем.
+        # Теперь «уже неактивен» считается тем же исходом, что и успешная отмена.
+        err = deploy.cancel_order_safe(Clore(env.get("CLORE_API_KEY")), int(oid),
+                                       body.get("issue"), logf=job_log, attempts=2, pause=3)
+        if err is not None:
+            raise RuntimeError(f"заказ {oid} отменить не удалось — он продолжает "
+                               f"оплачиваться: {err}")
+        # .env читаем заново: пока шла отмена, деплой мог записать туда новый заказ
+        current = str(deploy.load_env().get("ORDER") or "")
+        if str(oid) in (current, str(env.get("ORDER") or "")):
+            with JOB_LOCK:
+                running = JOB["running"]
+            if running:
+                # это заказ идущего деплоя — останавливаем его, иначе поток примет
+                # отменённый сервер за неподнявшийся и арендует следующий из очереди
+                JOB_STOP.set()
+                job_log(f"заказ {oid} отменён вручную — останавливаю деплой")
+            if str(oid) == current:
+                deploy.save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
         return {"ok": True, "cancelled": oid}
 
     if path == "/api/bench":

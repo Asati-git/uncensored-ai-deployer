@@ -227,6 +227,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .kv span { color: var(--muted); font-size: 11px; }
 
 .plan { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.plan-queue { margin: 4px 0 0; padding-left: 22px; }
+.plan-queue li { margin: 2px 0; }
 .log {
   background: color-mix(in srgb, var(--bg) 80%, #000); border: 1px solid var(--line);
   border-radius: 8px; padding: 12px;

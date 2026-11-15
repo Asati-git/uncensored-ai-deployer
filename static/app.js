@@ -15,8 +15,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
 // иначе поиск по имени не найдёт 5090 среди трёх десятков самых дешёвых предложений.
 const OFFERS_POOL = 400;
 const OFFERS_SHOWN = 30;
+// Сколько серверов можно поставить в очередь аренды. Деплой пробует их по порядку:
+// не поднялся первый — берётся следующий. Предел тот же, что в deploy.py.
+const MAX_PICK = 10;
 const TOP_KINDS = { uncensored: 'uncensored', top: 'top' };
-const state = { model: null, offer: null, env: null, polling: null, period: 'uncensored', gguf_file: '' };
+const state = { model: null, offers: [], env: null, polling: null, period: 'uncensored', gguf_file: '' };
 
 const PERIOD_NOTE = {
   uncensored: 'Модели, где цензуру сносили агрессивнее всего — дообучением либо хирургией по весам, ' +
@@ -270,7 +273,7 @@ async function pickModel() {
     const { model } = await api('/api/model?' + q);
     state.model = model;
     state.gguf_file = model.gguf_file || '';
-    state.offer = null;
+    state.offers = [];
     renderModelCard(model);
     applyNeed();
     $('f-disk').value = model.disk_gb;
@@ -432,8 +435,29 @@ function renderOffers() {
     ? `<p class="muted">Эксперты в оперативке: скорость определяет не карта, а пропускная
        способность RAM, поэтому порядок — по цене <b>за токен</b>, а не за час.
        Восьмиканальный EPYC обгоняет вдвое более дешёвый двухканальный десктоп.</p>` : '';
+  // Очередь аренды: хост может не поднять контейнер или оказаться занятым к моменту
+  // заказа, и тогда деплой идёт к следующему выбранному — без повторного подбора
+  const queueNote = state.offers.length
+    ? `<p class="muted">Очередь аренды (${state.offers.length} из ${MAX_PICK}):
+       ${state.offers.map((o, i) => `<b>${i + 1})</b> ${o.id} — ${o.gpu_count}× ${esc(o.gpu)}`).join(' · ')}.
+       Беру по порядку: не поднялся первый — пробую следующий.
+       <a href="#" id="queue-clear">очистить</a></p>`
+    : shown.length
+      ? `<p class="muted">Кнопка «В очередь» добавляет сервер в список аренды — можно выбрать
+         до ${MAX_PICK}. Если первый не поднимется, деплой возьмёт второй и так далее.
+         Ничего не выбрано — сервер подберётся автоматически.</p>`
+      : '';
 
-  box.innerHTML = limitNote + hiddenNote + banNote + ramNote + foundNote;
+  box.innerHTML = limitNote + hiddenNote + banNote + ramNote + queueNote + foundNote;
+  const queueClear = $('queue-clear');
+  if (queueClear) {
+    queueClear.onclick = (e) => {
+      e.preventDefault();
+      state.offers = [];
+      renderOffers();
+      renderPlan();
+    };
+  }
   const clearLink = $('ban-clear');
   if (clearLink) {
     clearLink.onclick = async (e) => {
@@ -451,7 +475,8 @@ function renderOffers() {
   }
   shown.slice(0, OFFERS_SHOWN).forEach((o, i) => {
     const item = el('div', 'item');
-    if (state.offer && state.offer.id === o.id) item.classList.add('sel');
+    const place = state.offers.findIndex((p) => p.id === o.id);   // -1 = не в очереди
+    if (place >= 0) item.classList.add('sel');
     const pay = o.pay_amount_used ? `списание ${fmtCoin(o.pay_amount_used, o.pay_currency_used)}/сутки` : '';
     const split = vllmSplit(o.gpu_count);   // пусто, если модель не на vLLM или раскладка обычная
     item.innerHTML = `<div class="main">
@@ -476,16 +501,24 @@ function renderOffers() {
       </div>
       <div class="side">
         ${i === 0 ? '<span class="badge">лучшая цена</span>' : ''}
+        ${place >= 0 ? `<span class="badge tier">${place + 1}-й в очереди</span>` : ''}
         ${split}
         <b>${fmtUsd(o.price_used)}</b>
-        <button>Выбрать</button>
+        <button>${place >= 0 ? 'Убрать' : 'В очередь'}</button>
       </div>`;
     item.querySelector('button').onclick = () => {
-      state.offer = o;
-      box.querySelectorAll('.item').forEach((n) => n.classList.remove('sel'));
-      item.classList.add('sel');
+      if (place >= 0) {
+        state.offers.splice(place, 1);
+        toast(`сервер ${o.id} убран из очереди`);
+      } else if (state.offers.length >= MAX_PICK) {
+        return toast(`уже выбрано ${MAX_PICK} серверов — больше Clore пробовать не станем`, true);
+      } else {
+        state.offers.push(o);
+        toast(`сервер ${o.id} — ${state.offers.length}-й в очереди аренды`);
+      }
+      // перерисовываем весь список: номера в очереди сдвигаются у всех выбранных
+      renderOffers();
       renderPlan();
-      toast(`сервер ${o.id} выбран`);
     };
     box.appendChild(item);
   });
@@ -539,21 +572,33 @@ async function loadOffers() {
     });
     if ($('f-price').value.trim()) q.set('max_price', $('f-price').value.trim());
     state.offersData = await api('/api/offers?' + q);
+    // Цена и доступность могли измениться — подтягиваем свежие данные для уже выбранных.
+    // Пропавших из выборки не выбрасываем: сервер мог просто не пройти новые фильтры,
+    // а очередь задал пользователь, и чистить её за него незачем
+    const fresh = new Map((state.offersData.offers || []).map((o) => [o.id, o]));
+    state.offers = state.offers.map((o) => fresh.get(o.id) || o);
     renderOffers();
+    renderPlan();
   } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
   finally { busy($('btn-offers'), false); }
 }
 
 // ───────── план деплоя ─────────
 function renderPlan() {
-  const m = state.model, o = state.offer;
+  const m = state.model, queue = state.offers;
   if (!m) { $('plan').innerHTML = '<p class="muted">Шаг 1: выберите модель на вкладке «Модель».</p>'; return; }
   $('need').innerHTML = `Модель <code>${esc(m.repo_id)}</code>: нужно ≈${m.vram_gib} GiB VRAM и ${m.disk_gb} GB диска, качать ${m.weights_gib} GiB.`;
+  // Очередь показываем целиком: платным окажется только тот сервер, который поднимется,
+  // но знать заранее, куда уйдёт деплой после первого отказа, полезно
+  const servers = queue.length
+    ? `<div class="muted" style="margin-top:6px">очередь аренды — пробую по порядку, пока один
+         не поднимется:</div>
+       <ol class="muted plan-queue">${queue.map((o) => `<li>сервер ${o.id}:
+         ${o.gpu_count}× ${esc(o.gpu)}, ${o.vram_gb} GiB VRAM, ${fmtUsd(o.price_used)}</li>`).join('')}</ol>`
+    : '<div class="muted" style="margin-top:6px">сервер не выбран — возьму самый выгодный из подходящих автоматически</div>';
   $('plan').innerHTML = `
     <div><b>${esc(m.repo_id)}</b> · ${esc(m.format)} → ${esc(m.engine)} · контекст ${fmtCtx(m.ctx)}</div>
-    <div class="muted" style="margin-top:6px">${o
-      ? `сервер ${o.id}: ${o.gpu_count}× ${esc(o.gpu)}, ${o.vram_gb} GiB VRAM, ${fmtUsd(o.price_used)}`
-      : 'сервер не выбран — возьму самый выгодный из подходящих автоматически'}</div>
+    ${servers}
     <div class="muted">тип заказа: ${esc($('order-type').value)} · оплата: автоматически USDC, BTC или CLORE по курсу</div>`;
 }
 
@@ -566,7 +611,7 @@ async function startDeploy(dryRun) {
     await api('/api/deploy', {
       model: state.model.repo_id,
       ctx: $('model-ctx').value || state.model.ctx,
-      server_id: state.offer?.id || null,
+      server_ids: state.offers.map((o) => o.id),
       order_type: $('order-type').value,
       max_price: $('f-price').value.trim() || null,
       gpu_filter: $('f-gpu').value.trim(),
