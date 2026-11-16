@@ -19,6 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import deploy
 import hfmodels
+import localpc
+import localrun
 from clore import PRICE_PERIOD_HOURS, Clore, CloreError, order_access, server_brief
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +41,11 @@ SETTING_KEYS = {
     "TG_BOT_TOKEN": True,
     "TG_CHAT_ID": False,
     "EXCLUDE_HOSTS": False,
+    # режим «Мой ПК»: ручная поправка, если железо определилось неверно (пусто = как есть)
+    "PC_VRAM_GB": False,
+    "PC_RAM_GB": False,
+    # куда класть llama.cpp и модели для своего ПК (пусто = профиль пользователя)
+    "LOCAL_DIR": False,
 }
 
 JOB = {"running": False, "log": [], "result": None, "error": None, "started": None, "title": None}
@@ -96,6 +103,91 @@ def run_deploy(cfg):
     threading.Thread(target=worker, daemon=True).start()
 
 
+# ---------- запуск на своём ПК ----------
+# Отдельная задача, а не JOB: аренда на Clore и локальный запуск друг другу не мешают,
+# и лог одного не должен затирать лог другого.
+LJOB = {"running": False, "log": [], "result": None, "error": None, "started": None, "title": None}
+LJOB_LOCK = threading.Lock()
+LJOB_STOP = threading.Event()
+
+
+def ljob_log(msg):
+    line = time.strftime("%H:%M:%S ") + str(msg)
+    print("[мой ПК] " + line, flush=True)
+    with LJOB_LOCK:
+        LJOB["log"].append(line)
+        del LJOB["log"][:-400]
+
+
+def run_local(env, body, token):
+    """Скачать llama.cpp и модель, проверить, запустить — в фоне, с логом для UI."""
+    ref = (body.get("ref") or "").strip()
+    if not ref:
+        raise ValueError("не выбрана модель")
+    isolation = body.get("isolation") or "native"
+    if isolation not in ("native", "docker"):
+        raise ValueError("неизвестный режим изоляции")
+    with LJOB_LOCK:
+        if LJOB["running"]:
+            raise RuntimeError("уже идёт установка — дождитесь или остановите её")
+        LJOB.update(running=True, log=[], result=None, error=None, started=time.time(), title=ref)
+    LJOB_STOP.clear()
+
+    def worker():
+        try:
+            ctx = int(body["ctx"]) if body.get("ctx") else None
+            info = localpc.model_info_cached(ref, ctx=ctx, token=token)
+            if info["engine"] != hfmodels.ENGINE_LLAMACPP:
+                raise localrun.LocalError("на своём ПК запускаются только GGUF-сборки")
+            pc = localpc.pc(env)
+            fit = localpc.fit(info, pc)
+            want = body.get("gguf_file") or (fit.get("best") or {}).get("path")
+            row = next((r for r in fit.get("options", []) if r["path"] == want), None)
+            if not row or not row.get("mode"):
+                raise localrun.LocalError("этот квант на этот ПК не влезает — выберите другой")
+            ljob_log(f"{row['label']}: {localpc.MODE_TEXT[row['mode']][0]}, контекст {row['ctx']}")
+            exe = None
+            if isolation == "native":
+                exe, meta = localrun.install_llama(env, pc["backend"], logf=ljob_log,
+                                                   stop=LJOB_STOP.is_set)
+                ljob_log(f"llama.cpp {meta['tag']} ({meta['variant']}) готов")
+            path = localrun.download_model(env, info["repo_id"], row["path"], token=token,
+                                           logf=ljob_log, stop=LJOB_STOP.is_set)
+            st = localrun.start(env, info["repo_id"], path, row["ctx"], row, isolation,
+                                pc["backend"], exe=exe, logf=ljob_log, stop=LJOB_STOP.is_set)
+            ljob_log(f"✅ модель отвечает: {st['url']}")
+            with LJOB_LOCK:
+                LJOB["result"] = {"status": "ready", "url": st["url"]}
+        except localrun.Stopped as e:
+            ljob_log(f"⏹ {e}")
+            with LJOB_LOCK:
+                LJOB["result"] = {"status": "stopped"}
+        except BaseException as e:  # noqa
+            ljob_log(f"⛔ {e}")
+            if not isinstance(e, (RuntimeError, ValueError, OSError)):
+                ljob_log(traceback.format_exc(limit=3))
+            with LJOB_LOCK:
+                LJOB["error"] = str(e) or e.__class__.__name__
+        finally:
+            with LJOB_LOCK:
+                LJOB["running"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def local_status(env):
+    st = localrun.status(env)
+    exe = st.get("exe")
+    return {
+        "run": st,
+        "docker": localrun.docker_available(),
+        "firewall": localrun.firewall_rule_present(exe) if exe else None,
+        "models": localrun.list_models(env),
+        "dir": localrun.data_dir(env),
+        "windows": os.name == "nt",
+    }
+
+
 # ---------- обработчики API ----------
 def env_state():
     env = deploy.load_env()
@@ -121,6 +213,9 @@ def env_state():
             "engine": env.get("ENGINE") or "",
             "ctx": env.get("CTX") or "",
             "alive": alive,
+            # заказы прерванной гонки: остаются, только если деплой упал посреди неё
+            "race_orders": [] if JOB["running"] else
+            [x for x in (env.get("RACE_ORDERS") or "").split(",") if x.strip()],
         },
         "defaults": {"ctx": deploy.DEFAULT_CTX, "images": deploy.IMAGES,
                      "api_port": deploy.API_PORT},
@@ -151,7 +246,33 @@ def api_get(path, q):
     if path == "/api/model":
         ref = (q.get("ref") or [""])[0]
         ctx = (q.get("ctx") or [""])[0]
-        return {"model": hfmodels.model_info(ref, ctx=int(ctx) if ctx else None, token=token)}
+        info = localpc.model_info_cached(ref, ctx=int(ctx) if ctx else None, token=token)
+        # оценка «на моём ПК» едет вместе с карточкой: железо опрошено и закешировано
+        return {"model": {**info, "local": localpc.fit(info, localpc.pc(env))}}
+
+    if path == "/api/local/pc":
+        return {"pc": localpc.pc(env, refresh=(q.get("refresh") or [""])[0] == "1")}
+
+    if path == "/api/local/status":
+        return local_status(env)
+
+    if path == "/api/local/job":
+        with LJOB_LOCK:
+            return {"running": LJOB["running"], "log": list(LJOB["log"]), "result": LJOB["result"],
+                    "error": LJOB["error"], "title": LJOB["title"],
+                    "elapsed": int(time.time() - LJOB["started"]) if LJOB["started"] else 0}
+
+    if path == "/api/local/fit":
+        # одна модель за запрос: UI проверяет список по несколько штук параллельно,
+        # и отметки появляются по мере готовности, а не после самой медленной
+        ref = (q.get("ref") or [""])[0]
+        ctx = (q.get("ctx") or [""])[0]
+        p = localpc.pc(env)
+        try:
+            info = localpc.model_info_cached(ref, ctx=int(ctx) if ctx else None, token=token)
+        except (RuntimeError, ValueError) as e:
+            return {"ref": ref, "fit": {"status": "unknown", "text": str(e)}}
+        return {"ref": ref, "fit": localpc.fit(info, p)}
 
     if path == "/api/wallets":
         clore = Clore(env.get("CLORE_API_KEY"))
@@ -257,6 +378,68 @@ def api_post(path, body):
             deploy.save_env_keys(updates)
         return {"ok": True, "saved": sorted(updates)}
 
+    if path == "/api/local/run":
+        run_local(env, body or {}, env.get("HF_TOKEN") or None)
+        return {"ok": True}
+
+    if path == "/api/local/stop":
+        # останавливаем и установку (если идёт), и запущенный сервер
+        LJOB_STOP.set()
+        return {"ok": True, "stopped": localrun.stop_running(env, logf=ljob_log)}
+
+    if path == "/api/local/delete":
+        localrun.delete_model(env, str((body or {}).get("repo") or ""))
+        return {"ok": True}
+
+    if path == "/api/local/firewall":
+        exe = localrun.load_state(env).get("exe")
+        if not exe:
+            raise ValueError("сначала запустите модель в обычном режиме — правило ставится на её llama-server")
+        localrun.firewall_block(exe)
+        return {"ok": True}
+
+    if path == "/api/local/opencode":
+        st = localrun.load_state(env)
+        if not st or not localrun.status(env).get("running"):
+            raise ValueError("на этом ПК модель не запущена")
+        ok = deploy.update_opencode(st["url"], st["key"], st["repo"].split("/")[-1],
+                                    logf=ljob_log, ctx=int(st["ctx"]), engine="llamacpp",
+                                    origin="мой ПК")
+        return {"ok": ok, "paths": list(deploy.OPENCODE_CFG_USED)}
+
+    if path == "/api/claude/desktop-off":
+        return {"ok": True, "removed": deploy.remove_claude_desktop()}
+
+    if path == "/api/claude":
+        # куда прописать Claude: target = cli | desktop, where = local | clore
+        b = body or {}
+        if b.get("where") == "local":
+            st = localrun.load_state(env)
+            if not st or not localrun.status(env).get("running"):
+                raise ValueError("на этом ПК модель не запущена")
+            url, key, ctx = st["url"], st["key"], int(st["ctx"])
+            title, origin, engine = st["repo"].split("/")[-1], "мой ПК", "llamacpp"
+        else:
+            current = deploy.load_env()
+            if not current.get("API_URL"):
+                raise ValueError("нет развёрнутой модели — сначала разверните её")
+            url, key = current["API_URL"], current.get("API_KEY", "")
+            ctx = int(current.get("CTX") or deploy.DEFAULT_CTX)
+            title, origin = (current.get("MODEL_REPO") or "").split("/")[-1], "Clore"
+            engine = current.get("ENGINE")
+        if b.get("target") == "desktop":
+            return {"ok": True, **deploy.write_claude_desktop(url, key, title, origin, engine,
+                                                               logf=ljob_log if b.get("where") == "local" else job_log)}
+        return {"ok": True, **deploy.write_claude_launcher(url, key, ctx, title, origin, engine,
+                                                            logf=ljob_log if b.get("where") == "local" else job_log)}
+
+    if path == "/api/local/bench":
+        st = localrun.load_state(env)
+        if not st:
+            raise ValueError("на этом ПК модель не запущена")
+        speed = deploy.bench(st["url"], st["key"], localrun.MODEL_NAME)
+        return {"ok": bool(speed), "tokens_per_sec": speed}
+
     if path == "/api/opencode":
         # Отдельная кнопка: деплой мог пройти до установки OpenCode, и тогда провайдера
         # прописывать было некуда. Заодно показывает точный путь — именно его ищут,
@@ -312,6 +495,8 @@ def api_post(path, body):
             "gguf_file": (body.get("gguf_file") or "").strip() or None,
             # эксперты MoE в оперативке: дешевле сервер ценой части скорости
             "cpu_moe": bool(body.get("cpu_moe")),
+            # параллельная установка на всех выбранных серверах: остаётся самый быстрый
+            "race": bool(body.get("race")),
             "ssh_password": (body.get("ssh_password") or "").strip() or None,
             "force": bool(body.get("force")),
             "dry_run": bool(body.get("dry_run")),
@@ -323,6 +508,27 @@ def api_post(path, body):
         if not env.get("API_KEY"):
             raise ValueError("не задан ключ вашего API (вкладка «Настройки»)")
         run_deploy(cfg)
+        return {"ok": True}
+
+    if path == "/api/deploy/stop":
+        with JOB_LOCK:
+            running = JOB["running"]
+        if not running:
+            raise ValueError("деплой не идёт")
+        JOB_STOP.set()
+        job_log("⏹ остановка по кнопке")
+        # Гонка свои заказы отменяет сама (RACE_ORDERS). А в очереди текущий заказ надо
+        # отменить отсюда: иначе остановленный деплой оставил бы его оплачиваться
+        cur = deploy.load_env()
+        oid = cur.get("ORDER")
+        if oid and not cur.get("RACE_ORDERS"):
+            err = deploy.cancel_order_safe(Clore(env.get("CLORE_API_KEY")), int(oid),
+                                           "остановлен вручную", logf=job_log, attempts=3, pause=3)
+            if err is not None:
+                raise RuntimeError(f"деплой остановлен, но заказ {oid} отменить не удалось — "
+                                   f"он оплачивается: {err}")
+            deploy.save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
+            job_log(f"заказ {oid} отменён")
         return {"ok": True}
 
     if path == "/api/cancel":
@@ -339,7 +545,11 @@ def api_post(path, body):
             raise RuntimeError(f"заказ {oid} отменить не удалось — он продолжает "
                                f"оплачиваться: {err}")
         # .env читаем заново: пока шла отмена, деплой мог записать туда новый заказ
-        current = str(deploy.load_env().get("ORDER") or "")
+        fresh = deploy.load_env()
+        race = [x for x in (fresh.get("RACE_ORDERS") or "").split(",") if x.strip()]
+        if str(oid) in race:
+            deploy.save_env_keys({"RACE_ORDERS": ",".join(x for x in race if x != str(oid))})
+        current = str(fresh.get("ORDER") or "")
         if str(oid) in (current, str(env.get("ORDER") or "")):
             with JOB_LOCK:
                 running = JOB["running"]

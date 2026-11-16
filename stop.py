@@ -6,7 +6,7 @@ stop.py — отменяет текущий заказ Clore из .env и соо
 отмена заказа освобождает сервер и удаляет контейнер вместе со скачанными весами.
 Следующий деплой качает модель заново.
 
-  python stop.py                       # отменить заказ из .env
+  python stop.py                       # отменить заказ из .env (и все заказы прерванной гонки)
   python stop.py --order 12345         # отменить конкретный заказ
   python stop.py --issue "GPU падает"  # приложить жалобу на хост
 """
@@ -15,7 +15,7 @@ import sys
 import time
 
 from clore import CloreError, order_access
-from deploy import client, load_env, log, save_env_keys, tg, wallet_balances
+from deploy import cancel_order_safe, client, load_env, log, save_env_keys, tg, wallet_balances
 
 # Отмену повторяем долго и настойчиво: неотменённый заказ тикает до конца срока
 # аренды, а это у Clore до 48 часов.
@@ -33,6 +33,25 @@ def main():
     if not env.get("CLORE_API_KEY"):
         log("в .env нет CLORE_API_KEY")
         return 1
+    # Параллельная установка держит номера всех своих заказов в RACE_ORDERS. Если деплой
+    # упал посреди гонки, их там может быть десяток, и все оплачиваются — отменяем каждый
+    race = [int(x) for x in (env.get("RACE_ORDERS") or "").split(",") if x.strip().isdigit()]
+    if race and not args.order:
+        clore = client(env)
+        left = []
+        for r in race:
+            if cancel_order_safe(clore, r, "остановлен вручную", attempts=ATTEMPTS,
+                                 pause=RETRY_PAUSE) is None:
+                log(f"заказ гонки {r} отменён")
+            else:
+                left.append(r)
+                log(f"⛔ заказ гонки {r} отменить не удалось — он оплачивается")
+        save_env_keys({"RACE_ORDERS": ",".join(str(r) for r in left)})
+        if left:
+            return 1
+        if not env.get("ORDER"):
+            return 0
+
     oid = args.order or env.get("ORDER")
     if not oid:
         log("в .env нет ORDER и не передан --order")

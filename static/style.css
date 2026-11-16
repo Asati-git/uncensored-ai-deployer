@@ -244,3 +244,26 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 #toast.show { opacity: 1; }
 #toast.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--panel)); color: var(--bad); }
+
+/* ───────── режим «Мой ПК» ───────── */
+.segmented.where { margin: 0; }
+.segmented.where button { padding: 5px 12px; font-size: 12px; }
+body.mode-pc .only-clore, body:not(.mode-pc) .only-pc { display: none; }
+.badge.fit { cursor: help; }
+.badge.fit-gpu { background: color-mix(in srgb, var(--ok) 16%, var(--panel)); color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 36%, var(--panel)); }
+.badge.fit-moe { background: color-mix(in srgb, var(--accent) 16%, var(--panel)); color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--panel)); }
+.badge.fit-partial, .badge.fit-cpu { background: color-mix(in srgb, var(--warn) 14%, var(--panel));
+  color: var(--warn); border-color: color-mix(in srgb, var(--warn) 32%, var(--panel)); }
+.badge.fit-no { background: color-mix(in srgb, var(--bad) 12%, var(--panel)); color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 30%, var(--panel)); }
+.badge.fit-need_gguf, .badge.fit-unknown, .badge.fit-wait { color: var(--muted);
+  background: var(--panel-2); border-color: var(--line); }
+.local-fit { margin-top: 12px; }
+.local-fit table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+.local-fit td, .local-fit th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.local-fit tr.best td { color: var(--text); font-weight: 600; }
+.pc-group { margin-top: 12px; }
+.pc-group h3 { font-size: 14px; margin: 0 0 6px; }
+.pc-group .variant { margin: 4px 0; }

@@ -1184,6 +1184,8 @@ def model_info(ref, ctx=None, token=None):
         "ctx_max": ctx_max,     # нативный потолок модели; None — в конфиге не нашлось
         "ctx_capped": bool(ctx_max and ctx_max > CTX_CAP),  # дефолт урезан нашим потолком
         "vocab": vocab,
+        # число слоёв: по нему локальный запуск считает -ngl при частичной выгрузке
+        "layers": int(cfg.get("num_hidden_layers") or cfg.get("n_layer") or 0),
         "vram_gib": vram_gib,
         # накладные расходы движка отдельной цифрой: в UI они объясняют разницу между
         # «веса + KV» и итогом, и повторять формулу в JS не нужно

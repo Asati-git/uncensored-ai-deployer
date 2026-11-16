@@ -97,7 +97,11 @@ ORDER_TIMEOUT = 20 * 60         # ждать, пока Clore выдаст IP и 
 # Общий предел ожидания. Он намеренно щедрый: решение «деплой не состоялся» принимается
 # по застою прогресса (STALL_TIMEOUT), а не по общему времени — см. wait_api.
 API_TIMEOUT = 5 * 3600
-STALL_TIMEOUT = 30 * 60         # прогресс не менялся столько — считаем, что всё встало
+# Сколько ждать, если на сервере ничего не меняется. Меряем не строку прогресса, а «пульс»:
+# скачанные байты + рост логов сборки и движка + занятая видеопамять. Сборка llama.cpp и
+# загрузка весов в VRAM идут по 10+ минут без смены стадии, но пульс у них есть всё время,
+# поэтому 5 минут полной тишины — это зависание, а не долгая работа.
+STALL_TIMEOUT = 5 * 60
 # Здоровый хост Clore отвечает по ssh через минуту-две после старта контейнера. Если за
 # это время нет ни ssh, ни статус-порта, ни API — контейнер не поднялся, и ждать его час
 # бессмысленно: он всё это время тарифицируется.
@@ -747,6 +751,7 @@ def ssh_alive(host, port, timeout=8):
 # Сборка движка и скачивание весов идут параллельно, поэтому стадию выбираем по
 # самой поздней активности: работает движок -> ещё качаем веса -> только собираем.
 _PROGRESS_CMD = (
+    'echo "beat=$(cat /root/deploy.log /root/engine.log /root/download.log 2>/dev/null | wc -c)"; '
     'if pgrep -x llama-server >/dev/null 2>&1 || pgrep -f "[v]llm serve" >/dev/null 2>&1; '
     'then echo engine; '
     'elif pgrep -f "[h]f download" >/dev/null 2>&1; '
@@ -776,7 +781,8 @@ def http_progress(host, port, timeout=8):
             data = json.loads(r.read().decode())
     except Exception:  # noqa — любой сбой просто означает «пока не знаем»
         return None
-    return {"stage": data.get("stage") or "setup", "bytes": int(data.get("bytes") or 0)}
+    return {"stage": data.get("stage") or "setup", "bytes": int(data.get("bytes") or 0),
+            "beat": int(data.get("beat") or 0), "gpu": int(data.get("gpu") or 0)}
 
 
 def progress_text(info, total_gib=None):
@@ -810,16 +816,39 @@ def remote_progress(host, port, timeout=20):
             capture_output=True, text=True, timeout=timeout + 15).stdout.split()
     except (OSError, subprocess.SubprocessError):
         return None
+    beat = 0
+    if out and out[0].startswith("beat="):
+        try:
+            beat = int(out.pop(0)[5:])
+        except ValueError:
+            pass
     if not out:
         return None
     if out[0] in ("engine", "setup"):
-        return {"stage": out[0], "bytes": 0}
+        return {"stage": out[0], "bytes": 0, "beat": beat}
     if out[0] == "download":
         try:
-            return {"stage": "download", "bytes": int(out[1]) * 1024 * 1024}  # du -sm отдаёт МиБ
+            return {"stage": "download", "bytes": int(out[1]) * 1024 * 1024, "beat": beat}  # du -sm — МиБ
         except (IndexError, ValueError):
-            return {"stage": "download", "bytes": 0}
+            return {"stage": "download", "bytes": 0, "beat": beat}
     return None
+
+
+def remote_tail(host, port, lines=12, timeout=15):
+    """Хвост логов сервера перед отменой: после отмены контейнер со всеми логами исчезает."""
+    if not host or not port:
+        return ""
+    cmd = (f"tail -n {int(lines)} /root/engine.log 2>/dev/null; echo ---; "
+           f"tail -n {int(lines)} /root/deploy.log 2>/dev/null")
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+             "-o", f"ConnectTimeout={timeout}", "-p", str(port), f"root@{host}", cmd],
+            capture_output=True, text=True, timeout=timeout + 15,
+            encoding="utf-8", errors="replace").stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def wait_sshd(host, port, timeout=600):
@@ -921,7 +950,7 @@ def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT, stop=None):
 
 
 def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=None,
-             total_gib=None, status_port=None, net_mbps=None, stop=None):
+             total_gib=None, status_port=None, net_mbps=None, stop=None, report=None):
     """
     Ждёт готовности модели. Возвращает "ready" / "stalled" / "slow".
 
@@ -935,7 +964,9 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
     """
     t0, noted, ssh_checked = time.time(), 0, ssh_host is None
     last_text, last_change, seen = None, time.time(), False
+    last_sig = None                  # пульс: (стадия, байты, рост логов, VRAM)
     mark = None                      # (время, байт) — точка отсчёта для замера скорости
+    prev = None                      # (время, байт) прошлого опроса — для текущей скорости
     while time.time() - t0 < timeout:
         check_stop(stop)
         if api_alive(url, key):
@@ -953,10 +984,19 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
             if info is None and ssh_host and ssh_alive(ssh_host, ssh_port, timeout=4):
                 info = remote_progress(ssh_host, ssh_port)
             text = progress_text(info, total_gib)
-            if text:
+            if info:
                 seen = True
-                if text != last_text:
-                    last_text, last_change = text, time.time()
+                sig = (info.get("stage"), info.get("bytes"), info.get("beat"), info.get("gpu"))
+                if sig != last_sig:
+                    last_sig, last_change = sig, time.time()
+                last_text = text or last_text
+            if report and info:
+                now, got = time.time(), info.get("bytes") or 0
+                rate = None
+                if prev and now > prev[0] and got >= prev[1]:
+                    rate = (got - prev[1]) / (now - prev[0])
+                prev = (now, got)
+                report({"stage": info.get("stage"), "bytes": got, "rate": rate})
             logf(f"ждём модель… {el // 60} мин — " +
                  (text or "установка движка + скачивание весов"))
             noted = el
@@ -977,8 +1017,8 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
         # Застой считаем только когда есть за чем следить: без источника прогресса
         # строка не меняется никогда, и выход по застою был бы ложным.
         if seen and time.time() - last_change > STALL_TIMEOUT:
-            logf(f"⛔ за {STALL_TIMEOUT // 60} мин ничего не изменилось: {last_text}")
-            return "stalled"
+            logf(f"⛔ за {STALL_TIMEOUT // 60} мин на сервере ничего не изменилось: {last_text}")
+            return "stalled-engine" if (last_sig or ("",))[0] == "engine" else "stalled"
         time.sleep(30)
     return "stalled"
 
@@ -1173,7 +1213,268 @@ def _sync_v2_provider(cfg, url, key, title, ctx):
     return True
 
 
-def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
+# ───────── Claude Code / Claude Desktop ─────────
+# Claude Code говорит только на Anthropic Messages (POST /v1/messages). llama-server его
+# умеет, vLLM — тоже; TabbyAPI — нет. Обычный `claude` и ~/.claude/settings.json не трогаем:
+# рядом кладём отдельную команду claude-uncensored, которая выставляет переменные только
+# для своего запуска. Так ваш Claude с подпиской остаётся как был.
+CLAUDE_LAUNCHER = "claude-uncensored"
+CLAUDE_MIN_CTX = 32768      # системный промпт и инструменты Claude Code — это уже ~20 тыс. токенов
+_SAFE_SHELL = re.compile(r"^[A-Za-z0-9_.:/\-]+$")
+
+
+def anthropic_base(url):
+    """Claude ждёт адрес без /v1 — путь /v1/messages он дописывает сам."""
+    url = (url or "").rstrip("/")
+    return url[:-3] if url.endswith("/v1") else url
+
+
+def claude_supported(engine):
+    if engine == hfmodels.ENGINE_TABBY:
+        return False, ("Claude понимает только протокол Anthropic (/v1/messages), а TabbyAPI "
+                       "(модели EXL2/EXL3) его не отдаёт. Подойдёт GGUF или safetensors-модель")
+    return True, ""
+
+
+def _claude_env(url, key, ctx):
+    ctx = int(ctx or DEFAULT_CTX)
+    return {
+        "ANTHROPIC_BASE_URL": anthropic_base(url),
+        "ANTHROPIC_AUTH_TOKEN": key,         # уходит как Authorization: Bearer — его и ждёт сервер
+        "ANTHROPIC_API_KEY": "",             # чтобы не перебил чужой ключ из окружения
+        "ANTHROPIC_MODEL": MODEL_NAME,
+        # служебные запросы Claude Code шлёт «быстрой» модели — пусть идут туда же
+        "ANTHROPIC_DEFAULT_FABLE_MODEL": MODEL_NAME,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": MODEL_NAME,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": MODEL_NAME,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": MODEL_NAME,
+        "CLAUDE_CODE_SUBAGENT_MODEL": MODEL_NAME,
+        # иначе Claude Code считает окно в 200 тыс. и упрётся в контекст модели, не успев сжать разговор
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(ctx),
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(4096, min(32000, ctx // 4))),
+        # бета-поля Anthropic чужой сервер может не понять и ответить 400
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        # без телеметрии и автообновлений: в этом запуске всё идёт только на вашу модель
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
+
+
+def _claude_bin_dir():
+    """Каталог, где лежит claude: он заведомо в PATH, значит и claude-uncensored найдётся."""
+    import shutil
+    exe = shutil.which("claude")
+    if exe:
+        d = os.path.dirname(os.path.abspath(exe))
+        if os.access(d, os.W_OK):
+            return d, True
+    return os.path.join(os.path.expanduser("~"), ".local", "bin"), bool(exe)
+
+
+def write_claude_launcher(url, key, ctx=None, title=None, origin="Clore", engine=None, logf=log):
+    """Пишет команду claude-uncensored (.cmd для Windows и sh-скрипт). Возвращает dict."""
+    ok, why = claude_supported(engine)
+    if not ok:
+        raise ValueError(why)
+    env = _claude_env(url, key, ctx)
+    # значения подставляются в скрипт оболочки — пропускаем только безопасные символы
+    for k, v in env.items():
+        if v and not _SAFE_SHELL.match(v):
+            raise ValueError(f"{k}: недопустимые символы — не стану вписывать это в скрипт")
+    d, found = _claude_bin_dir()
+    os.makedirs(d, exist_ok=True)
+    head = f"{title or MODEL_NAME} ({'this PC' if origin == 'мой ПК' else origin})"
+    head = re.sub(r"[^A-Za-z0-9 _.()/-]", "", head)
+    cmd = ["@echo off", f"rem {head}: Claude Code on your own model. Generated by UncensoredAI.",
+           "rem Your normal `claude` is untouched; these variables live only in this run.",
+           "setlocal"]
+    cmd += [f'set "{k}={v}"' for k, v in env.items()]
+    cmd += ["claude %*", ""]
+    sh = ["#!/bin/sh", f"# {head}: Claude Code on your own model. Generated by UncensoredAI."]
+    sh += [f"export {k}='{v}'" if v else f"unset {k}" for k, v in env.items()]
+    sh += ['exec claude "$@"', ""]
+    paths = []
+    p_cmd = os.path.join(d, CLAUDE_LAUNCHER + ".cmd")
+    p_sh = os.path.join(d, CLAUDE_LAUNCHER)
+    if os.name == "nt":
+        with open(p_cmd, "w", encoding="ascii", newline="\r\n") as f:
+            f.write("\n".join(cmd))
+        paths.append(p_cmd)
+    with open(p_sh, "w", encoding="ascii", newline="\n") as f:
+        f.write("\n".join(sh))
+    if os.name != "nt":
+        os.chmod(p_sh, 0o700)
+    paths.append(p_sh)
+    logf(f"Claude Code: команда {CLAUDE_LAUNCHER} записана в {d}")
+    warn = []
+    if not found:
+        warn.append("Claude Code не найден в PATH — поставьте его (npm i -g @anthropic-ai/claude-code), "
+                    f"а каталог {d} добавьте в PATH")
+    if int(ctx or DEFAULT_CTX) < CLAUDE_MIN_CTX:
+        warn.append(f"контекст {int(ctx or DEFAULT_CTX)} маловат: одни инструкции Claude Code "
+                    f"занимают ~20 тыс. токенов. Нужно хотя бы {CLAUDE_MIN_CTX}")
+    for w in warn:
+        logf("внимание: " + w)
+    return {"paths": paths, "dir": d, "command": CLAUDE_LAUNCHER, "warnings": warn}
+
+
+DESKTOP_ENTRY = "UncensoredAI"
+# Claude Desktop вычёркивает из списка модели, в id которых нет модели Anthropic
+# ("is not an Anthropic model and was removed"). Поэтому для него у нашей модели второе имя.
+# Sonnet 4.5 выбран сознательно: окно 200 тыс. (а не 1M) и без adaptive thinking —
+# меньше параметров, которых llama.cpp не поймёт. llama-server имя модели не сверяет,
+# vLLM отдаёт модель под обоими именами (templates/onstart_vllm.sh).
+DESKTOP_MODEL_ID = f"{MODEL_NAME}/claude-sonnet-4-5"
+
+
+def _served_models(url, key):
+    req = urllib.request.Request(url.rstrip("/") + "/models", headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode())
+        return {m.get("id") for m in d.get("data") or [] if isinstance(m, dict)}
+    except Exception:  # noqa
+        return None
+
+
+def _desktop_library():
+    """configLibrary Claude Desktop: сюда же пишет его окно Configure Third-Party Inference."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "Claude-3p", "configLibrary")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Claude-3p/configLibrary")
+    return os.path.expanduser("~/.config/Claude-3p/configLibrary")
+
+
+def _desktop_managed():
+    """Политика администратора перекрывает локальную настройку целиком — о ней надо предупредить."""
+    if os.name != "nt":
+        return None
+    import winreg
+    for hive, name in ((winreg.HKEY_LOCAL_MACHINE, "HKLM"), (winreg.HKEY_CURRENT_USER, "HKCU")):
+        try:
+            with winreg.OpenKey(hive, r"SOFTWARE\Policies\Claude") as k:
+                if winreg.QueryInfoKey(k)[1]:
+                    return name + r"\SOFTWARE\Policies\Claude"
+        except OSError:
+            pass
+    return None
+
+
+def write_claude_desktop(url, key, title=None, origin="Clore", engine=None, logf=log):
+    """
+    Прописывает модель в Claude Desktop — в режим стороннего провайдера (Claude Desktop on 3P).
+    Пишем то же, что пишет окно Developer → Configure Third-Party Inference: отдельную запись
+    UncensoredAI в configLibrary и делаем её применённой. Чужие записи не трогаем. Ключ кладём
+    открытым — Desktop при запуске сам шифрует его DPAPI (так описано в его документации).
+    """
+    import uuid
+    ok, why = claude_supported(engine)
+    if not ok:
+        raise ValueError(why)
+    lib = _desktop_library()
+    os.makedirs(lib, exist_ok=True)
+    meta_path = os.path.join(lib, "_meta.json")
+    meta = {}
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            raise ValueError(f"не могу прочитать {meta_path} — поправьте или удалите его в окне настройки Claude Desktop")
+        if not isinstance(meta, dict):
+            raise ValueError(f"{meta_path}: неожиданный формат — не трогаю")
+        backup = meta_path + ".before-uncensoredai"
+        if not os.path.exists(backup):
+            with open(backup, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+    entries = [e for e in (meta.get("entries") or []) if isinstance(e, dict)]
+    mine = next((e for e in entries if e.get("name") == DESKTOP_ENTRY
+                 and re.fullmatch(r"[a-f0-9-]{36}", str(e.get("id", "")))), None)
+    if not mine:
+        mine = {"id": str(uuid.uuid4()), "name": DESKTOP_ENTRY}
+        entries.append(mine)
+    label = f"{title or MODEL_NAME} ({origin})"
+    cfg = {
+        "inferenceProvider": "gateway",
+        "inferenceGatewayBaseUrl": anthropic_base(url),
+        "inferenceGatewayApiKey": key,
+        "inferenceGatewayAuthScheme": "bearer",
+        # без явного списка Desktop покажет только модели с «claude» в id — нашей там не будет
+        "inferenceModels": [{"name": DESKTOP_MODEL_ID, "labelOverride": label}],
+    }
+    cfg_path = os.path.join(lib, mine["id"] + ".json")
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, cfg_path)
+    prev = meta.get("appliedId")
+    meta["entries"] = entries
+    meta["appliedId"] = mine["id"]
+    tmp = meta_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, meta_path)
+    logf(f"Claude Desktop: запись «{DESKTOP_ENTRY}» в {lib} применена")
+    warn = []
+    if engine == hfmodels.ENGINE_VLLM:
+        served = _served_models(url, key)
+        if served is not None and DESKTOP_MODEL_ID not in served:
+            warn.append("сервер поднят старой версией софта и не знает имени модели для Desktop — "
+                        "Desktop получит ошибку 404. Разверните модель заново")
+    managed = _desktop_managed()
+    if managed:
+        warn.append(f"есть политика администратора {managed} — Desktop возьмёт настройки оттуда, а не наши")
+    prev_name = next((e.get("name") for e in entries if e.get("id") == prev), None)
+    if prev and prev != mine["id"]:
+        warn.append(f"до этого была выбрана конфигурация «{prev_name or prev}» — она сохранена, "
+                    "вернуть её можно в окне Configure Third-Party Inference")
+    return {"dir": lib, "entry": DESKTOP_ENTRY, "label": label, "warnings": warn,
+            "base_url": anthropic_base(url), "model": DESKTOP_MODEL_ID}
+
+
+def remove_claude_desktop(logf=log):
+    """Снимает нашу запись: Desktop возвращается к прежней конфигурации (или к обычному входу)."""
+    lib = _desktop_library()
+    meta_path = os.path.join(lib, "_meta.json")
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return False
+    entries = [e for e in (meta.get("entries") or []) if isinstance(e, dict)]
+    mine = [e for e in entries if e.get("name") == DESKTOP_ENTRY]
+    if not mine:
+        return False
+    ids = {e.get("id") for e in mine}
+    for i in ids:
+        if re.fullmatch(r"[a-f0-9-]{36}", str(i)):
+            try:
+                os.remove(os.path.join(lib, i + ".json"))
+            except OSError:
+                pass
+    rest = [e for e in entries if e.get("id") not in ids]
+    meta["entries"] = rest
+    if meta.get("appliedId") in ids:
+        backup = meta_path + ".before-uncensoredai"
+        old = None
+        try:
+            with open(backup, encoding="utf-8") as f:
+                old = json.load(f).get("appliedId")
+        except (OSError, ValueError):
+            pass
+        keep = old if any(e.get("id") == old for e in rest) else (rest[0]["id"] if rest else None)
+        if keep:
+            meta["appliedId"] = keep
+        else:
+            meta.pop("appliedId", None)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    logf("Claude Desktop: запись UncensoredAI снята")
+    return True
+
+
+def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None, origin="Clore"):
     """
     Прописывает провайдера во все конфиги OpenCode, какие есть в системе. Именно во все:
     OpenCode складывает конфиги из нескольких мест, и забытый провайдер со старым адресом
@@ -1212,7 +1513,8 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None):
         prov = cfg.setdefault("provider", {}).setdefault(OPENCODE_PROVIDER, {})
         prov.setdefault("npm", OPENCODE_NPM)
         if title:
-            prov["name"] = f"{title} (Clore)"
+            # origin — где крутится модель: на сервере Clore или на этом ПК
+            prov["name"] = f"{title} ({origin})"
         opts = prov.setdefault("options", {})
         opts["baseURL"] = url
         opts["apiKey"] = key
@@ -1403,32 +1705,28 @@ def deploy(cfg, env=None, logf=log):
     # Заказ могут отменить руками, пока он поднимается. Без этой проверки деплой принимал
     # отменённый сервер за неподнявшийся и молча арендовал следующего кандидата.
     stop = cfg.get("stop")
-    tried = 0
-    for offer in candidates:
-        check_stop(stop)
-        tried += 1
+    race = bool(cfg.get("race")) and len(candidates) > 1
+
+    def plan(offer, lg):
+        """Валюта, выгрузка экспертов и контекст под этот сервер. None — сервер не годится."""
         sid = offer["id"]
-        if len(candidates) > 1:
-            logf(f"— попытка {tried} из {len(candidates)}: сервер {sid}")
         currency, amount, usd = pick_currency(offer, balances, rates, forced_currency)
         if not amount:
-            logf(f"сервер {sid}: нет цены в валюте {currency} — беру следующий")
-            continue
+            lg(f"сервер {sid}: нет цены в валюте {currency} — пропускаю")
+            return None
         if balances.get(currency, 0) <= 0:
-            logf(f"сервер {sid}: принимает только {currency}, а на этом кошельке пусто — "
-                 f"беру следующий")
-            continue
+            lg(f"сервер {sid}: принимает только {currency}, а на этом кошельке пусто — пропускаю")
+            return None
         # Выгружаем минимум необходимого: каждый слой в оперативке — это работа для CPU.
         # На большой карте выгрузка может не понадобиться вовсе, даже если включена.
         card_gib = offer["vram_gb"] / max(offer["gpu_count"], 1)
         n_cpu_moe = (hfmodels.cpu_moe_layers(offload, info["vram_gib"], offer["vram_gb"],
                                              card_gib=card_gib) if cpu_moe else 0)
-        order_env["N_CPU_MOE"] = str(n_cpu_moe)
         if n_cpu_moe:
-            logf(f"эксперты {n_cpu_moe} слоёв из {offload['max_layers']} уедут в оперативку "
-                 f"({offer['vram_gb']} GiB VRAM против {info['vram_gib']} нужных)")
+            lg(f"эксперты {n_cpu_moe} слоёв из {offload['max_layers']} уедут в оперативку "
+               f"({offer['vram_gb']} GiB VRAM против {info['vram_gib']} нужных)")
         elif cpu_moe:
-            logf(f"карта вмещает модель целиком — выгрузка не нужна")
+            lg("карта вмещает модель целиком — выгрузка не нужна")
         # Контекст задают до выбора сервера, поэтому он может в карту и не влезть.
         # Подгоняем под фактическую VRAM: иначе OOM через полчаса после начала скачивания.
         gpu_weights = info["weights_gib"] - (n_cpu_moe * offload["per_layer_gib"]
@@ -1436,19 +1734,28 @@ def deploy(cfg, env=None, logf=log):
         fit_ctx = hfmodels.ctx_for_vram(info["ctx"], info["kv_gib"], gpu_weights,
                                         offer["vram_gb"] / VRAM_HEADROOM,
                                         info.get("vocab") or 0)
-        order_env["CTX"] = str(fit_ctx)
         fit_need = hfmodels.vram_estimate(gpu_weights, info["kv_gib"] * fit_ctx / info["ctx"],
                                           info.get("vocab") or 0)
         if fit_need > offer["vram_gb"]:
             # даже на минимальном контексте не влезает: бывает только при ручном выборе
             # сервера, фильтр такие предложения не пропускает
-            logf(f"⚠️ модель не влезает в {offer['vram_gb']} GiB VRAM ни при каком контексте "
-                 f"(нужно {fit_need} GiB даже при {fit_ctx}) — запуск, скорее всего, упадёт по OOM")
+            lg(f"⚠️ модель не влезает в {offer['vram_gb']} GiB VRAM ни при каком контексте "
+               f"(нужно {fit_need} GiB даже при {fit_ctx}) — запуск, скорее всего, упадёт по OOM")
         elif fit_ctx < info["ctx"]:
-            logf(f"⚠️ контекст {info['ctx']} не влезает в {offer['vram_gb']} GiB VRAM — "
-                 f"ставлю {fit_ctx}. Нужен полный контекст — берите карту крупнее")
-        logf(f"арендую сервер {sid} ({offer['gpu_count']}x {offer['gpu']}) за ${usd:.3f}/ч "
-             f"(списание {amount:g} {currency}/сутки)")
+            lg(f"⚠️ контекст {info['ctx']} не влезает в {offer['vram_gb']} GiB VRAM — "
+               f"ставлю {fit_ctx}. Нужен полный контекст — берите карту крупнее")
+        oenv = {**order_env, "N_CPU_MOE": str(n_cpu_moe), "CTX": str(fit_ctx)}
+        return {"currency": currency, "amount": amount, "usd": usd, "env": oenv,
+                "fit_ctx": fit_ctx, "n_cpu_moe": n_cpu_moe}
+
+    def rent(offer, p, lg, track):
+        """
+        Создаёт заказ и находит его номер. Возвращает номер заказа или None — тогда этот
+        сервер пропускаем. track(oid) записывает заказ туда, откуда его найдёт отмена.
+        """
+        sid = offer["id"]
+        lg(f"арендую сервер {sid} ({offer['gpu_count']}x {offer['gpu']}) за ${p['usd']:.3f}/ч "
+           f"(списание {p['amount']:g} {p['currency']}/сутки)")
         # Запоминаем, какие заказы на этом сервере уже есть: иначе чужой (или свой прошлый)
         # заказ на том же сервере будет принят за только что созданный
         try:
@@ -1457,142 +1764,127 @@ def deploy(cfg, env=None, logf=log):
             before = set()
         try:
             clore.create_order(
-                server_id=sid, image=image, currency=currency, order_type=order_type,
+                server_id=sid, image=image, currency=p["currency"], order_type=order_type,
                 ports={22: "tcp", API_PORT: "tcp", STATUS_PORT: "tcp"},
-                env=order_env, command=command,
+                env=p["env"], command=command,
                 ssh_password=ssh_password, ssh_key=pubkey,
                 # обычный образ (nvidia/cuda) не содержит sshd и долгоживущего процесса —
                 # без entrypoint Clore контейнер не держится и SSH недоступен
                 autossh_entrypoint=True,
-                spot_price=amount if order_type == "spot" else None,
-                required_price=amount,
+                spot_price=p["amount"] if order_type == "spot" else None,
+                required_price=p["amount"],
             )
+            unsure = False
         except CloreError as e:
             if getattr(e, "uncertain", False):
                 # Ответ не дошёл, а запрос мог: заказ, возможно, создан и уже
                 # тарифицируется. Не уходим к следующему серверу, а ищем его ниже.
-                logf(f"сервер {sid}: {e} — ответ Clore не получен, проверяю, "
-                     f"не создался ли заказ")
+                lg(f"сервер {sid}: {e} — ответ Clore не получен, проверяю, не создался ли заказ")
                 unsure = True
             else:
-                logf(f"сервер {sid}: {e} — беру следующий")
+                lg(f"сервер {sid}: {e} — пропускаю")
                 # HTTP 500 не зависит от сервера (чаще всего слишком длинная команда
                 # заказа) — перебирать остальных кандидатов бессмысленно
                 if getattr(e, "code", None) == 1 and "HTTP 500" in str(e):
                     raise SystemExit("Clore отвечает HTTP 500 на создание заказа — проблема "
-                                     "не в сервере. Чаще всего это слишком длинная команда "
-                                     "заказа")
-                continue
-        else:
-            unsure = False
-
+                                     "не в сервере. Чаще всего это слишком длинная команда заказа")
+                return None
         # Заказ уже создан и тарифицируется. Любая сетевая ошибка дальше не должна
-        # оставить его сиротой: записываем номер сервера в .env сразу, ещё до опроса,
-        # чтобы stop.py смог отменить заказ даже если всё остальное упадёт.
-        save_env_keys({"SERVER": str(sid)})
+        # оставить его сиротой: номер сервера запоминаем сразу, ещё до опроса.
+        track(None, sid)
         time.sleep(POLL)
-        found = None
         for _ in range(6):
             try:
                 orders = [o for o in clore.my_orders()
                           if int(o.get("si", -1)) == int(sid) and not o.get("expired")
                           and int(o.get("id", -1)) not in before]
             except CloreError as e:
-                logf(f"не смог прочитать список заказов ({e}) — повторяю")
+                lg(f"не смог прочитать список заказов ({e}) — повторяю")
                 time.sleep(POLL)
                 continue
             if orders:
                 found = max(orders, key=lambda o: o.get("ct") or 0)
-                save_env_keys({"ORDER": str(found["id"])})
-                break
+                track(found["id"], sid)
+                lg(f"заказ {found['id']} создан на сервере {sid}")
+                return found["id"]
             time.sleep(POLL)
-        if not found and unsure:
+        if unsure:
             # за две минуты заказ так и не появился — значит, запрос до Clore не дошёл
-            logf(f"сервер {sid}: заказ не создался — беру следующий")
-            save_env_keys({"SERVER": ""})
-            continue
-        if not found:
-            # Clore подтвердил создание, но заказа в списке нет. Идти дальше нельзя:
-            # он может тарифицироваться, и следующий сервер стал бы вторым оплачиваемым.
-            msg = (f"заказ на сервер {sid} создан, но не появился в списке заказов. Он может "
-                   f"тарифицироваться: проверьте вкладку «Заказы» и отмените его вручную. "
-                   f"К следующему серверу не перехожу")
-            tg(env, "⛔ " + msg)
-            raise SystemExit(msg)
+            lg(f"сервер {sid}: заказ не создался — пропускаю")
+            track(None, None)
+            return None
+        # Clore подтвердил создание, но заказа в списке нет. Идти дальше нельзя:
+        # он может тарифицироваться, и следующий сервер стал бы вторым оплачиваемым.
+        msg = (f"заказ на сервер {sid} создан, но не появился в списке заказов. Он может "
+               f"тарифицироваться: проверьте вкладку «Заказы» и отмените его вручную")
+        tg(env, "⛔ " + msg)
+        raise SystemExit(msg)
 
-        oid = found["id"]
-        check_stop(stop)
-        logf(f"заказ {oid} создан на сервере {sid}")
-        tg(env, f"🚀 Clore: заказ {oid}, {offer['gpu_count']}x {offer['gpu']} "
-                f"({offer['vram_gb']} GiB VRAM), ${usd:.3f}/ч (списание {amount:g} {currency}).\n"
-                f"Ставлю {info['engine']} и качаю {info['repo_id']} ({info['weights_gib']} GiB).")
-
-        ready = wait_order_ready(clore, oid, logf, stop=stop)
+    def bring_up(offer, p, oid, lg, stp, report=None, on_access=None):
+        """
+        Ждёт, пока заказ получит адрес и модель ответит. Ничего не отменяет — это решает
+        вызывающий. Возвращает dict: status = ready | fail, плюс подробности.
+        """
+        ready = wait_order_ready(clore, oid, lg, stop=stp)
         if not ready:
-            logf(f"заказ {oid} не выдал адрес за {ORDER_TIMEOUT // 60} мин — отменяю")
-            cancel_or_halt(clore, env, oid, "сервер не стартовал", logf)
-            save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
-            continue
-
-        order, acc = ready
+            return {"status": "fail", "why": f"не выдал адрес за {ORDER_TIMEOUT // 60} мин",
+                    "reason": "сервер не стартовал"}
+        _, acc = ready
         host = acc["host"]
         # регион виден только сейчас — раньше Clore его не сообщает
         hit = host_excluded(host, exclude_hosts)
         if hit:
-            logf(f"сервер {sid} оказался в исключённом регионе ({host} содержит «{hit}») — "
-                 f"отменяю заказ {oid} и беру следующий")
-            cancel_or_halt(clore, env, oid, "исключённый регион", logf)
-            save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
-            continue
+            return {"status": "fail", "why": f"исключённый регион ({host} содержит «{hit}»)",
+                    "reason": "исключённый регион"}
         api_url = f"http://{host}:{acc['ports'][API_PORT]}/v1"
-        ssh = f"ssh -p {acc['ports'].get(22, 22)} root@{host}"
-        save_env_keys({"ORDER": str(oid), "SERVER": str(sid), "API_URL": api_url, "SSH": ssh,
-                       "MODEL_REPO": info["repo_id"], "MODEL_NAME": MODEL_NAME,
-                       "CTX": str(fit_ctx), "ENGINE": info["engine"]})
-        logf(f"контейнер поднят. API будет на {api_url}; {ssh} (пароль: {ssh_password})")
-
-        sign = wait_alive(host, acc["ports"], api_url, api_key, logf, stop=stop)
+        ssh_port = acc["ports"].get(22, 22)
+        ssh = f"ssh -p {ssh_port} root@{host}"
+        if on_access:
+            on_access(api_url, ssh)
+        lg(f"контейнер поднят. API будет на {api_url}; {ssh} (пароль: {ssh_password})")
+        sign = wait_alive(host, acc["ports"], api_url, api_key, lg, stop=stp)
         if not sign:
-            drop_server(clore, env, oid, sid,
-                        f"контейнер молчал {SILENT_LIMIT // 60} мин после аренды", logf)
-            continue
-        logf(f"сервер отвечает ({sign})")
-
+            return {"status": "fail", "why": f"контейнер молчал {SILENT_LIMIT // 60} мин после аренды",
+                    "reason": "контейнер не отвечал", "blacklist": True}
+        lg(f"сервер отвечает ({sign})")
         # Фиксированных 90 минут не хватает большим моделям: 150+ ГиБ по реальному каналу
         # качаются полтора часа, и деплой падал по таймауту, уже почти доехав.
         api_timeout = max(API_TIMEOUT, int(offer.get("download_hours", 0) * 3600 * 2.5) + 30 * 60)
-        if api_timeout > API_TIMEOUT:
-            logf(f"модель большая — жду до {api_timeout // 60} мин вместо {API_TIMEOUT // 60}")
-        # Сравниваем именно с «ready». Тут стояло `if not wait_api(...)`, а функция
-        # возвращает строку: и "ready", и "slow", и "stalled" — непустые, то есть
-        # истинные. Ветка отказа не исполнялась ни разу с самого первого коммита:
-        # любой деплой рапортовал успех, прописывал мёртвый адрес в OpenCode и не слал
-        # ни одного предупреждения в Telegram. Снаружи это выглядело как «✅ модель
-        # готова» сразу после «⛔ за 30 мин ничего не изменилось».
-        outcome = wait_api(api_url, api_key, logf, timeout=api_timeout,
-                           ssh_host=host, ssh_port=acc["ports"].get(22, 22),
+        # Сравниваем именно с «ready»: wait_api возвращает непустую строку и при отказе.
+        outcome = wait_api(api_url, api_key, lg, timeout=api_timeout,
+                           ssh_host=host, ssh_port=ssh_port,
                            total_gib=info.get("weights_gib"),
-                           status_port=acc["ports"].get(STATUS_PORT), stop=stop)
+                           status_port=acc["ports"].get(STATUS_PORT), stop=stp, report=report)
+        if outcome == "ready":
+            return {"status": "ready", "api_url": api_url, "ssh": ssh}
         if outcome == "slow":
-            # канал оказался в разы медленнее заявленного — сервер негодный,
-            # его не разбирают, а меняют на следующего кандидата
-            drop_server(clore, env, oid, sid, "скачивание в разы медленнее заявленного", logf)
-            continue
-        if outcome != "ready":
-            tg(env, f"⛔ Заказ {oid}: деплой остановлен — прогресс встал более чем на "
-                    f"{STALL_TIMEOUT // 60} мин (или вышел общий лимит {api_timeout // 60} мин). "
-                    f"Сервер оставлен для разбора: {ssh}\nЛоги: /root/deploy.log, /root/download.log, /root/engine.log")
-            logf(f"⛔ деплой не удался ({outcome}). Сервер оставлен для разбора: {ssh}")
-            # Очередь дальше не идём намеренно: заказ живой и тарифицируется, а второй
-            # сервер означал бы оплату двух сразу. Решение — за пользователем
-            if tried < len(candidates):
-                logf(f"остальные {len(candidates) - tried} серверов очереди не трогаю: "
-                     f"этот заказ ещё оплачивается. Отмените его и запустите деплой заново, "
-                     f"если хотите попробовать следующий")
-            return {"status": "timeout", "order": oid, "api_url": api_url, "ssh": ssh}
+            # канал оказался в разы медленнее заявленного — сервер негодный
+            return {"status": "fail", "why": "скачивание в разы медленнее заявленного",
+                    "reason": "медленная сеть", "blacklist": True}
+        # Завис. Логи забираем до отмены: вместе с контейнером исчезнут и они
+        tail = remote_tail(host, ssh_port)
+        if tail:
+            lg("последние строки логов сервера:\n" + tail)
+        return {"status": "fail", "reason": "завис",
+                "why": f"за {STALL_TIMEOUT // 60} мин на сервере ничего не изменилось",
+                # движок упал на уже скачанных весах — дело, скорее всего, в модели или
+                # контексте, и на другом сервере будет то же самое
+                "model_problem": outcome == "stalled-engine"}
 
+    def drop(oid, sid, res, lg):
+        """Отменить неудачный заказ; сервер с явной поломкой — в чёрный список."""
+        if res.get("blacklist"):
+            blacklist_add(sid, res["why"])
+        return cancel_order_safe(clore, oid, res.get("reason", "")[:64], lg)
+
+    def finish(offer, p, oid, api_url, ssh):
+        """Модель поднялась: замер скорости, OpenCode, итог в лог и Telegram."""
+        sid, usd, amount, currency = offer["id"], p["usd"], p["amount"], p["currency"]
+        save_env_keys({"ORDER": str(oid), "SERVER": str(sid), "API_URL": api_url, "SSH": ssh,
+                       "MODEL_REPO": info["repo_id"], "MODEL_NAME": MODEL_NAME,
+                       "CTX": str(p["fit_ctx"]), "ENGINE": info["engine"]})
         speed = bench(api_url, api_key)
-        if n_cpu_moe:
+        if p["n_cpu_moe"]:
             # С экспертами в оперативке первый замер нечестно низкий: файл ещё не весь
             # в страничном кэше, и часть экспертов читается с диска. Замерено на живом
             # сервере: 8 ток/с сразу после старта против 19 через минуту прогрева.
@@ -1600,38 +1892,241 @@ def deploy(cfg, env=None, logf=log):
         # при пакетных прогонах переключать OpenCode на каждую проверяемую модель незачем
         if not cfg.get("skip_opencode"):
             update_opencode(api_url, api_key, info["repo_id"].split("/")[-1], logf,
-                            ctx=fit_ctx, engine=info["engine"])
-        # Баланс нужен только для справочной строки. Раньше разовый сбой сети здесь ронял
-        # полностью удавшийся деплой: модель уже работала, а в лог уходило «⛔ ошибка API»
-        # вместо адреса и скорости.
+                            ctx=p["fit_ctx"], engine=info["engine"])
+        # Баланс нужен только для справочной строки. Разовый сбой сети здесь не должен
+        # ронять полностью удавшийся деплой.
         try:
-            balances = wallet_balances(clore)
-            bal_usd = sum(amount * rates.get(cur, 0) for cur, amount in balances.items())
+            bals = wallet_balances(clore)
+            bal = sum(a * rates.get(cur, 0) for cur, a in bals.items())
         except CloreError as e:
             logf(f"баланс не прочитался ({e}) — на результат деплоя это не влияет")
-            bal_usd = 0.0
-        hours = f"{bal_usd / usd:.0f} ч" if bal_usd and usd else "?"
+            bal = 0.0
+        hours = f"{bal / usd:.0f} ч" if bal and usd else "?"
         msg = [f"✅ {info['repo_id']} готова",
                f"Base URL: {api_url}", f"Модель в API: {MODEL_NAME}", f"Движок: {info['engine']}"]
         if speed:
             msg.append(f"Скорость: {speed:.0f} ток/с")
         msg += [f"Сервер: {offer['gpu_count']}x {offer['gpu']}, ${usd:.3f}/ч "
                 f"(списание {amount:g} {currency})",
-                f"SSH: {ssh}", f"Баланс: ≈${bal_usd:.2f} (~{hours})"]
+                f"SSH: {ssh}", f"Баланс: ≈${bal:.2f} (~{hours})"]
         if not cfg.get("skip_opencode"):
             msg.append("OpenCode переключён (" + ", ".join(OPENCODE_CFG_USED)
                        + ") — перезапустите его.")
-        # итог нужен в логе, а не только в Telegram: бот настроен далеко не у всех,
-        # а без него от всего прогона оставалось одно слово «готово»
+        # итог нужен в логе, а не только в Telegram: бот настроен далеко не у всех
         for line in msg:
             logf(line)
         tg(env, "\n".join(msg))
         return {"status": "ready", "order": oid, "server": sid, "api_url": api_url, "ssh": ssh,
                 "model": info, "speed": speed, "price_usd": usd, "pay_amount": amount,
-                "currency": currency, "balance_usd": round(bal_usd, 2), "offer": offer}
+                "currency": currency, "balance_usd": round(bal, 2), "offer": offer}
+
+    if race:
+        return _deploy_race(candidates, plan, rent, bring_up, drop, finish, clore, env,
+                            info, stop, logf)
+
+    # ── по очереди: не поднялся первый — берём следующий ──
+    def track_seq(oid, sid):
+        save_env_keys({"ORDER": str(oid) if oid else "", "SERVER": str(sid) if sid else ""})
+
+    def access_seq(api_url, ssh):
+        save_env_keys({"API_URL": api_url, "SSH": ssh, "MODEL_REPO": info["repo_id"],
+                       "MODEL_NAME": MODEL_NAME, "ENGINE": info["engine"]})
+
+    tried = 0
+    for offer in candidates:
+        check_stop(stop)
+        tried += 1
+        sid = offer["id"]
+        if len(candidates) > 1:
+            logf(f"— попытка {tried} из {len(candidates)}: сервер {sid}")
+        p = plan(offer, logf)
+        if not p:
+            continue
+        oid = rent(offer, p, logf, track_seq)
+        if not oid:
+            continue
+        check_stop(stop)
+        tg(env, f"🚀 Clore: заказ {oid}, {offer['gpu_count']}x {offer['gpu']} "
+                f"({offer['vram_gb']} GiB VRAM), ${p['usd']:.3f}/ч (списание {p['amount']:g} "
+                f"{p['currency']}).\nСтавлю {info['engine']} и качаю {info['repo_id']} "
+                f"({info['weights_gib']} GiB).")
+        res = bring_up(offer, p, oid, logf, stop, on_access=access_seq)
+        if res["status"] == "ready":
+            return finish(offer, p, oid, res["api_url"], res["ssh"])
+        logf(f"⛔ сервер {sid}: {res['why']} — отменяю заказ {oid}")
+        if res.get("blacklist"):
+            blacklist_add(sid, res["why"])
+        # отмена не прошла — дальше нельзя: второй сервер оплачивался бы вместе с первым
+        cancel_or_halt(clore, env, oid, res.get("reason", ""), logf)
+        save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
+        if res.get("model_problem"):
+            msg = (f"⛔ модель скачалась, но движок не запустился на сервере {sid} — похоже, "
+                   f"дело в модели или контексте, а не в сервере. Остальные серверы очереди "
+                   f"не пробую: там было бы то же самое. Логи — выше")
+            tg(env, msg)
+            raise SystemExit(msg)
+        if tried < len(candidates):
+            logf("беру следующий сервер очереди")
 
     tg(env, f"⛔ Не удалось арендовать ни один из {tried} серверов Clore.")
     raise SystemExit(f"не удалось арендовать ни один из {tried} серверов")
+
+
+# Гонка: сколько серверов держим, даже если они отстают от лидера, — на случай, если
+# лидер упадёт уже на запуске движка. И во сколько раз прогноз окончания скачивания может
+# быть хуже, чем у лидера, прежде чем сервер отменяем, чтобы не платить за него зря.
+RACE_KEEP = 2
+RACE_CULL_RATIO = 1.5
+RACE_CULL_AFTER = 3 * 60        # раньше скорость скачивания ещё не устоялась
+
+
+def _deploy_race(candidates, plan, rent, bring_up, drop, finish, clore, env, info, stop, logf):
+    """
+    Параллельная установка: арендуем все выбранные серверы сразу, побеждает тот, где модель
+    поднялась первой, остальные отменяем. Clore считает аренду поминутно, поэтому проигравшие
+    стоят минуты, а не часы. Номера всех заказов гонки лежат в .env (RACE_ORDERS), чтобы
+    stop.py отменил их, даже если этот процесс упадёт.
+    """
+    import threading
+    lock = threading.Lock()
+    tracked = set()
+    total = (info.get("weights_gib") or 0) * GIB_BYTES
+
+    def save_tracked():
+        save_env_keys({"RACE_ORDERS": ",".join(str(o) for o in sorted(tracked))})
+
+    def track(oid, sid):
+        if oid:
+            with lock:
+                tracked.add(int(oid))
+                save_tracked()
+
+    def untrack(oid):
+        with lock:
+            tracked.discard(int(oid))
+            save_tracked()
+
+    logf(f"параллельная установка на {len(candidates)} серверах: побеждает первый, где модель "
+         f"поднимется, остальные отменяю. Clore считает аренду поминутно")
+    racers = {}           # oid -> состояние
+    winner = None
+    try:
+        # 1. арендуем всех. create_order у Clore не чаще раза в 5 с — это займёт минуту-две
+        for offer in candidates:
+            check_stop(stop)
+            sid = offer["id"]
+            lg = (lambda s: (lambda m: logf(f"[{s}] {m}")))(sid)
+            p = plan(offer, lg)
+            if not p:
+                continue
+            oid = rent(offer, p, lg, track)
+            if oid:
+                racers[int(oid)] = {"offer": offer, "p": p, "sid": sid, "lg": lg, "res": None,
+                                    "cull": False, "bytes": 0, "rate": None, "stage": None,
+                                    "t0": time.time()}
+        if not racers:
+            raise SystemExit(f"не удалось арендовать ни один из {len(candidates)} серверов")
+        tg(env, f"🚀 Clore: гонка на {len(racers)} серверах — {info['repo_id']} "
+                f"({info['weights_gib']} GiB). Оставлю самый быстрый")
+        done = threading.Event()
+
+        def run(oid):
+            r = racers[oid]
+            stp = lambda: bool(stop and stop()) or done.is_set() or r["cull"]  # noqa: E731
+            try:
+                r["res"] = bring_up(r["offer"], r["p"], oid, r["lg"], stp,
+                                    report=lambda d: r.update({k: v for k, v in d.items()
+                                                               if v is not None}))
+            except DeployStopped:
+                r["res"] = {"status": "stopped"}
+            except Exception as e:  # noqa — сбой одного участника не должен валить гонку
+                r["res"] = {"status": "fail", "why": f"ошибка: {e}", "reason": "ошибка деплоя"}
+
+        threads = {oid: threading.Thread(target=run, args=(oid,), daemon=True) for oid in racers}
+        for t in threads.values():
+            t.start()
+
+        finished = set()
+        last_board = 0
+        while True:
+            if stop and stop():
+                raise DeployStopped("деплой остановлен вручную")
+            for oid, r in racers.items():
+                if oid in finished or r["res"] is None:
+                    continue
+                finished.add(oid)
+                res = r["res"]
+                if res["status"] == "ready" and winner is None:
+                    winner = oid
+                    done.set()
+                    r["lg"]("🏁 модель поднялась первой — этот сервер и оставляю")
+                elif res["status"] == "fail":
+                    r["lg"](f"⛔ {res['why']} — отменяю заказ {oid}")
+                    if drop(oid, r["sid"], res, r["lg"]) is None:
+                        untrack(oid)
+                    if res.get("model_problem"):
+                        r["lg"]("движок упал на скачанных весах — похоже, дело в модели; "
+                                "на остальных серверах, скорее всего, будет то же")
+            if winner is not None:
+                break
+            if len(finished) == len(racers):
+                break
+            # Отсев отстающих: по прогнозу окончания скачивания относительно лидера
+            live = [(oid, r) for oid, r in racers.items() if oid not in finished and not r["cull"]]
+            etas = {}
+            for oid, r in live:
+                if (r["stage"] == "download" and r["rate"] and total
+                        and time.time() - r["t0"] > RACE_CULL_AFTER):
+                    etas[oid] = max(0.0, total - r["bytes"]) / r["rate"]
+            if len(etas) >= 2 and len(live) > RACE_KEEP:
+                best = min(etas.values())
+                for oid, eta in sorted(etas.items(), key=lambda x: -x[1]):
+                    if len([1 for _, r in live if not r["cull"]]) <= RACE_KEEP:
+                        break
+                    if eta > best * RACE_CULL_RATIO + 120:
+                        r = racers[oid]
+                        r["cull"] = True
+                        r["lg"](f"отстаёт: докачает через ~{eta / 60:.0f} мин, лидер — через "
+                                f"~{best / 60:.0f} мин. Отменяю, чтобы не платить зря")
+                        if cancel_order_safe(clore, oid, "медленнее других", r["lg"]) is None:
+                            untrack(oid)
+            # сводка раз в две минуты: кто сколько скачал
+            if time.time() - last_board > 120:
+                last_board = time.time()
+                rows = []
+                for oid, r in racers.items():
+                    if oid in finished or r["cull"]:
+                        continue
+                    got = r["bytes"] / GIB_BYTES
+                    spd = f", {r['rate'] * 8 / 1e6:.0f} Mbps" if r["rate"] else ""
+                    rows.append(f"{r['sid']}: {r['stage'] or 'старт'} {got:.1f} ГиБ{spd}")
+                if rows:
+                    logf("гонка: " + " · ".join(rows))
+            time.sleep(10)
+    finally:
+        # всё, что не победило, — отменяем, что бы ни случилось выше
+        for oid in sorted(tracked):
+            if oid == winner:
+                continue
+            r = racers.get(oid)
+            lg = r["lg"] if r else logf
+            if cancel_order_safe(clore, oid, "проиграл гонку", lg) is None:
+                tracked.discard(oid)
+            else:
+                lg(f"⛔ заказ {oid} отменить не удалось — он оплачивается. Отмените его на "
+                   f"вкладке «Заказы» или через stop.py")
+        save_env_keys({"RACE_ORDERS": ",".join(str(o) for o in sorted(tracked - {winner}))})
+        if winner is not None and len(racers) > 1:
+            logf(f"остальные {len(racers) - 1} заказов гонки отменены")
+
+    if winner is None:
+        msg = f"ни на одном из {len(racers)} серверов модель не поднялась"
+        tg(env, "⛔ " + msg)
+        raise SystemExit(msg)
+    r = racers[winner]
+    res = r["res"]
+    logf(f"победил сервер {r['sid']} за {(time.time() - r['t0']) / 60:.0f} мин")
+    return finish(r["offer"], r["p"], winner, res["api_url"], res["ssh"])
 
 
 # ---------- CLI ----------
@@ -1665,6 +2160,8 @@ def main():
     ap.add_argument("--cpu-moe", action="store_true",
                     help="у MoE-модели держать экспертов в оперативке (llama.cpp): "
                          "карта нужна в разы скромнее, скорость ниже на проценты")
+    ap.add_argument("--race", action="store_true",
+                    help="ставить на все серверы из --server параллельно и оставить самый быстрый")
     ap.add_argument("--force", action="store_true", help="арендовать ещё один сервер")
     ap.add_argument("--dry-run", action="store_true", help="только показать кандидатов")
     args = ap.parse_args()
@@ -1678,7 +2175,7 @@ def main():
                   "gguf_file": args.gguf_file, "skip_opencode": args.no_opencode,
                   "allow_old_gpu": args.allow_old_gpu, "spread": args.spread,
                   "cpu_moe": args.cpu_moe,
-                  "exclude_hosts": args.exclude_hosts,
+                  "exclude_hosts": args.exclude_hosts, "race": args.race,
                   "force": args.force, "dry_run": args.dry_run}, env)
     return 0 if res.get("status") in ("ready", "already-running", "dry-run") else 1
 

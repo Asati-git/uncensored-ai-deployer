@@ -89,7 +89,7 @@ if [ -z "${TOOL_PARSER}" ] || ! vllm serve --help=all 2>/dev/null | grep -q -- "
 fi
 stage engine
 setsid nohup vllm serve "${MODEL_DIR}" \
-  --served-model-name "${MODEL_NAME}" \
+  --served-model-name "${MODEL_NAME}" "${MODEL_NAME}/claude-sonnet-4-5" \
   --host 0.0.0.0 --port "${PORT}" \
   --api-key "${API_KEY}" \
   --max-model-len "${CTX}" \

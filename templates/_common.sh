@@ -206,7 +206,20 @@ class H(http.server.BaseHTTPRequestHandler):
             st = open("/root/.stage").read().strip()
         except OSError:
             st = "setup"
-        body = json.dumps({"stage": st, "bytes": n}).encode()
+        # «пульс»: растёт, пока контейнер чем-то занят (сборка, загрузка в VRAM) —
+        # по нему деплой отличает долгую работу от зависания
+        beat = 0
+        for p in ("/root/deploy.log", "/root/engine.log", "/root/download.log"):
+            try:
+                beat += os.path.getsize(p)
+            except OSError:
+                pass
+        try:
+            gpu = sum(int(x) for x in os.popen("nvidia-smi --query-gpu=memory.used "
+                      "--format=csv,noheader,nounits 2>/dev/null").read().split())
+        except ValueError:
+            gpu = 0
+        body = json.dumps({"stage": st, "bytes": n, "beat": beat, "gpu": gpu}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

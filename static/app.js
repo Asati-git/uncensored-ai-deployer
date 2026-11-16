@@ -19,7 +19,10 @@ const OFFERS_SHOWN = 30;
 // не поднялся первый — берётся следующий. Предел тот же, что в deploy.py.
 const MAX_PICK = 10;
 const TOP_KINDS = { uncensored: 'uncensored', top: 'top' };
-const state = { model: null, offers: [], env: null, polling: null, period: 'uncensored', gguf_file: '' };
+const state = { model: null, offers: [], env: null, polling: null, period: 'uncensored', gguf_file: '',
+  // где запускать: 'clore' — аренда сервера, 'pc' — этот компьютер. Запоминаем между сессиями
+  // ссылка /#pc открывает сразу режим ПК — удобно для закладки
+  where: (location.hash === '#pc' || localStorage.getItem('where') === 'pc') ? 'pc' : 'clore', pc: null };
 
 const PERIOD_NOTE = {
   uncensored: 'Модели, где цензуру сносили агрессивнее всего — дообучением либо хирургией по весам, ' +
@@ -117,8 +120,14 @@ async function loadState() {
 function renderCurrent() {
   const c = state.env?.current || {};
   const box = $('current');
-  if (!c.order) { box.innerHTML = '<p class="muted">Активного заказа нет.</p>'; return; }
-  box.innerHTML = `<div class="grid">
+  // Заказы гонки, которую прервали (упал UI или компьютер): они оплачиваются, а в карточку
+  // как «текущий» не попадают — без этого предупреждения про них никто бы не узнал
+  const race = (c.race_orders || []);
+  const raceNote = race.length
+    ? `<p class="warn-text">⚠ Остались заказы прерванной параллельной установки: ${race.map(esc).join(', ')}.
+       Они оплачиваются — отмените их на вкладке «Заказы» (или <code>python stop.py</code>).</p>` : '';
+  if (!c.order) { box.innerHTML = raceNote + '<p class="muted">Активного заказа нет.</p>'; return; }
+  box.innerHTML = raceNote + `<div class="grid">
     <div class="kv"><b>${esc(c.order)}</b><span>заказ Clore</span></div>
     <div class="kv"><b>${esc(c.server || '—')}</b><span>сервер</span></div>
     <div class="kv"><b>${c.alive ? 'онлайн' : 'поднимается'}</b><span>состояние API</span></div>
@@ -157,6 +166,7 @@ function modelItem(m) {
     <div class="side">
       <span class="badge ${esc(m.format)}">${esc(m.format)}</span>
       ${m.gated ? '<span class="badge gated">gated</span>' : ''}
+      ${fitSlot(m.repo_id, m.format)}
       <a class="muted" href="${esc(m.url)}" target="_blank" rel="noreferrer">HF ↗</a>
       <button class="primary">Выбрать</button>
     </div>`;
@@ -180,6 +190,7 @@ function topModel(m) {
     row.innerHTML = `<span class="badge ${esc(v.format)}">${esc(v.format)}</span>
       <span class="muted">${esc(ENGINE_OF[v.format] || 'vLLM')}</span>
       <code class="repo">${esc(v.repo_id)}</code>
+      ${fitSlot(v.repo_id, v.format)}
       <a class="muted" href="${esc(v.url)}" target="_blank" rel="noreferrer">HF ↗</a>
       <button class="primary">Выбрать</button>`;
     const slot = el('div', 'picked hidden');
@@ -256,6 +267,7 @@ async function searchModels() {
     models.forEach((m) => {
       box.appendChild(top ? topItem(m) : modelItem(m));
     });
+    annotateFits(box);
   } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
   finally { busy($('btn-search'), false); }
 }
@@ -274,7 +286,14 @@ async function pickModel() {
     state.model = model;
     state.gguf_file = model.gguf_file || '';
     state.offers = [];
+    // на своём ПК квант выбирается под это железо, а не под сервер
+    const best = model.local?.best;
+    if (state.where === 'pc' && best?.path) state.gguf_file = best.path;
     renderModelCard(model);
+    if (state.where === 'pc' && best?.path) {
+      const o = (model.gguf_options || []).find((x) => x.path === best.path);
+      if (o) applyQuant(o);
+    }
     applyNeed();
     $('f-disk').value = model.disk_gb;
     $('model-ctx').value = model.ctx;
@@ -302,7 +321,7 @@ function quantSelect(m) {
   const node = el('label', 'muted quant', `Квант
     <select>${opts.map((o) => `
       <option value="${esc(o.path)}"${o.path === state.gguf_file ? ' selected' : ''}>
-        ${esc(o.label)} — ${o.weights_gib} ГиБ, нужно ≈${o.vram_gib} ГиБ VRAM${o.parts > 1 ? ` (${o.parts} частей)` : ''}
+        ${localMark(m, o.path)}${esc(o.label)} — ${o.weights_gib} ГиБ, нужно ≈${o.vram_gib} ГиБ VRAM${o.parts > 1 ? ` (${o.parts} частей)` : ''}
       </option>`).join('')}</select>${note}`);
   node.querySelector('select').onchange = (e) => applyQuant(opts.find((x) => x.path === e.target.value));
   return node;
@@ -363,7 +382,7 @@ function renderModelCard(m) {
     ${m.ctx_max && m.ctx_max > m.ctx ? `<p class="muted" style="margin:6px 0 0">Модель держит
       ${fmtCtx(m.ctx_max)} контекста, по умолчанию берём ${fmtCtx(m.ctx)}: на полном KV-кэш
       требует больше VRAM, чем сама модель. Поднять — поле «контекст» выше, пересчитается сразу.</p>` : ''}
-    ${m.cpu_moe ? `<p class="muted" style="margin:6px 0 0">Это MoE: ${m.moe.experts} экспертов,
+    ${m.cpu_moe ? `<p class="muted only-clore" style="margin:6px 0 0">Это MoE: ${m.moe.experts} экспертов,
       на токен работают ${m.moe.active}. Поэтому их можно держать в обычной оперативке и считать
       на CPU: карта нужна в разы скромнее. Но и скорость падает в разы — на одной и той же
       RTX 3090 замерено 155 ток/с против 24 при полной выгрузке. Это способ поднять модель,
@@ -376,6 +395,9 @@ function renderModelCard(m) {
       Выгрузить их в оперативку умеет только llama.cpp — то есть нужна GGUF-сборка этой же
       модели, там на карте останутся единицы гигабайт вместо ${m.vram_gib}.</p>` : ''}`;
 
+  $('model-card').insertAdjacentHTML('beforeend', localBlock(m));
+  const inst = $('model-card').querySelector('.local-install');
+  if (inst) inst.onclick = () => installLocal();
   const sel = quantSelect(m);
   if (sel) $('model-card').querySelector('.quant-slot').appendChild(sel);
 }
@@ -590,9 +612,12 @@ function renderPlan() {
   $('need').innerHTML = `Модель <code>${esc(m.repo_id)}</code>: нужно ≈${m.vram_gib} GiB VRAM и ${m.disk_gb} GB диска, качать ${m.weights_gib} GiB.`;
   // Очередь показываем целиком: платным окажется только тот сервер, который поднимется,
   // но знать заранее, куда уйдёт деплой после первого отказа, полезно
+  const race = $('d-race').checked && queue.length > 1;
   const servers = queue.length
-    ? `<div class="muted" style="margin-top:6px">очередь аренды — пробую по порядку, пока один
-         не поднимется:</div>
+    ? `<div class="muted" style="margin-top:6px">${race
+        ? `арендую все ${queue.length} сразу и ставлю параллельно — оставлю тот, где модель поднимется
+           первой, остальные отменю:`
+        : 'очередь аренды — пробую по порядку, пока один не поднимется:'}</div>
        <ol class="muted plan-queue">${queue.map((o) => `<li>сервер ${o.id}:
          ${o.gpu_count}× ${esc(o.gpu)}, ${o.vram_gb} GiB VRAM, ${fmtUsd(o.price_used)}</li>`).join('')}</ol>`
     : '<div class="muted" style="margin-top:6px">сервер не выбран — возьму самый выгодный из подходящих автоматически</div>';
@@ -619,6 +644,7 @@ async function startDeploy(dryRun) {
       ssh_password: $('d-ssh').value.trim(),
       gguf_file: state.gguf_file || '',
       cpu_moe: cpuMoeOn(),
+      race: $('d-race').checked && state.offers.length > 1,
       force: $('d-force').checked,
       dry_run: !!dryRun,
     });
@@ -638,6 +664,7 @@ function pollJob() {
       $('job-log').scrollTop = $('job-log').scrollHeight;
       $('job-elapsed').textContent = j.running ? `· идёт ${Math.floor(j.elapsed / 60)} мин ${j.elapsed % 60} с` : '';
       $('btn-deploy').disabled = j.running;
+      $('btn-job-stop').classList.toggle('hidden', !j.running);
       if (!j.running) {
         clearInterval(state.polling);
         state.polling = null;
@@ -751,6 +778,392 @@ async function saveSettings() {
   finally { busy($('btn-save'), false); }
 }
 
+// ───────── мой ПК ─────────
+// Отметки «влезет ли на этот компьютер». Оценку делает сервер (localpc.py) по железу
+// той машины, где запущен UI, — здесь только показ и очередь запросов.
+const FIT_TEXT = {
+  gpu: '✓ влезет в видеокарту',
+  moe: '✓ эксперты в RAM',
+  partial: '≈ часть в RAM, медленно',
+  cpu: '≈ только процессор',
+  no: '✗ не влезет',
+  need_gguf: 'для ПК нужен GGUF',
+  unknown: '? не проверить',
+};
+const MODE_SHORT = { gpu: '✓ ', moe: '◐ ', partial: '≈ ', cpu: '≈ ' };
+const MODE_NAME = { gpu: 'видеокарта', moe: 'эксперты в RAM', partial: 'часть слоёв в RAM', cpu: 'процессор' };
+const BACKEND = { cuda: 'CUDA', vulkan: 'Vulkan', metal: 'Metal', cpu: 'только процессор' };
+const fitCache = new Map();
+const FIT_PARALLEL = 4;   // HF не любит залпы; по четыре — отметки появляются за секунды
+const fitQueue = [];
+let fitRunning = 0;
+
+const fitBadge = (f) => f
+  ? `<span class="badge fit fit-${esc(f.status)}" title="${esc(f.text || '')}">${esc(FIT_TEXT[f.status] || f.status)}</span>`
+  : '<span class="badge fit fit-wait">проверяю ПК…</span>';
+
+// место под отметку; видно только в режиме «Мой ПК» (класс only-pc)
+function fitSlot(ref, format) {
+  return `<span class="fit-slot only-pc" data-ref="${esc(ref)}" data-format="${esc(format)}"></span>`;
+}
+
+function fetchFit(ref) {
+  if (fitCache.has(ref)) return fitCache.get(ref);
+  const p = new Promise((resolve) => { fitQueue.push({ ref, resolve }); pumpFits(); });
+  fitCache.set(ref, p);
+  return p;
+}
+
+function pumpFits() {
+  while (fitRunning < FIT_PARALLEL && fitQueue.length) {
+    const { ref, resolve } = fitQueue.shift();
+    fitRunning++;
+    api('/api/local/fit?' + new URLSearchParams({ ref }))
+      .then((r) => resolve(r.fit))
+      .catch((e) => resolve({ status: 'unknown', text: e.message }))
+      .finally(() => { fitRunning--; pumpFits(); });
+  }
+}
+
+// Расставить отметки в уже нарисованном списке. Вне режима ПК запросы к HF не тратим.
+function annotateFits(root) {
+  if (state.where !== 'pc') return;
+  root.querySelectorAll('.fit-slot').forEach((slot) => {
+    if (slot.dataset.format !== 'gguf') {
+      slot.innerHTML = fitBadge({ status: 'need_gguf',
+        text: 'локально запускается llama.cpp — ищите GGUF-сборку этой модели' });
+      return;
+    }
+    slot.innerHTML = fitBadge(null);
+    fetchFit(slot.dataset.ref).then((f) => { slot.innerHTML = fitBadge(f); });
+  });
+}
+
+// значок режима перед квантом в выпадающем списке
+function localMark(m, path) {
+  if (state.where !== 'pc' || !m.local?.options) return '';
+  const row = m.local.options.find((r) => r.path === path);
+  return row ? (row.mode ? MODE_SHORT[row.mode] : '✗ ') : '';
+}
+
+function localBlock(m) {
+  const f = m.local;
+  if (!f) return '';
+  const head = `<div class="row" style="gap:8px">${fitBadge(f)}<span>${esc(f.text || '')}</span></div>`;
+  if (!f.options?.length) return `<div class="local-fit only-pc"><h2>На этом ПК</h2>${head}</div>`;
+  const rows = f.options.map((r) => `<tr class="${f.best && r.path === f.best.path ? 'best' : ''}">
+      <td>${esc(r.label)}</td><td>${r.weights_gib} ГиБ</td>
+      <td>${r.mode ? esc(MODE_NAME[r.mode]) : '<span class="warn-text">не влезет</span>'}</td>
+      <td>${r.ctx ? fmtCtx(r.ctx) : '—'}</td>
+      <td>${r.mode ? `${r.vram_gib} / ${r.ram_gib}` : '—'}</td>
+      <td>${r.n_cpu_moe != null ? `--n-cpu-moe ${r.n_cpu_moe}` : r.ngl != null ? `-ngl ${r.ngl}` : ''}</td></tr>`).join('');
+  const pc = state.pc;
+  const runBtn = f.best ? `<button class="primary local-install" style="margin-top:8px">
+      Поставить на этот ПК</button>` : '';
+  return `<div class="local-fit only-pc"><h2>На этом ПК</h2>${head}${runBtn}
+    <table><tr><th>квант</th><th>веса</th><th>где считается</th><th>контекст</th>
+      <th>VRAM / RAM, ГиБ</th><th>llama.cpp</th></tr>${rows}</table>
+    <p class="muted" style="margin:6px 0 0">${pc ? `Модели доступно ${pc.vram_usable_gib} ГиБ VRAM и
+      ${pc.ram_usable_gib} ГиБ RAM — за вычетом занятого системой. ` : ''}Контекст подбирается от
+      поля «контекст» вниз, пока модель не влезет, но не ниже 16k.</p></div>`;
+}
+
+function renderPc() {
+  const p = state.pc;
+  if (!p) return;
+  const gpus = p.gpus.length
+    ? p.gpus.map((g) => `${esc(g.name)} — ${g.vram_gib} ГиБ`).join('<br>')
+    : '<span class="warn-text">не найдена</span>';
+  const ov = p.override || {};
+  $('pc-info').innerHTML = `<div class="grid">
+      <div class="kv"><b>${gpus}</b><span>видеокарта</span></div>
+      <div class="kv"><b>${p.vram_usable_gib} из ${p.vram_total_gib} ГиБ</b>
+        <span>VRAM для модели${ov.vram ? ' (задано вручную)' : ''}</span></div>
+      <div class="kv"><b>${p.ram_usable_gib} из ${p.ram_total_gib} ГиБ</b>
+        <span>RAM для модели${ov.ram ? ' (задано вручную)' : ''}</span></div>
+      <div class="kv"><b>${esc(p.cpu)}</b><span>процессор · ${p.cores} потоков</span></div>
+      <div class="kv"><b>${esc(BACKEND[p.backend] || p.backend)}</b><span>сборка llama.cpp</span></div>
+      <div class="kv"><b>${p.disk_free_gib} ГиБ</b><span>свободно на диске</span></div>
+    </div>
+    ${p.warnings.map((w) => `<p class="warn-text" style="margin:8px 0 0">⚠ ${esc(w)}</p>`).join('')}
+    <p class="muted" style="margin:8px 0 0">${p.unified
+      ? 'Память общая для процессора и видеочипа: модели отдаётся около двух третей.'
+      : `Резерв: ${p.vram_reserve_gib} ГиБ видеопамяти — столько занято прямо сейчас (рабочий стол,
+        браузер), и ${p.ram_reserve_gib} ГиБ оперативки — системе и открытым программам.`}</p>`;
+}
+
+async function loadPc(refresh) {
+  try {
+    const { pc } = await api('/api/local/pc' + (refresh ? '?refresh=1' : ''));
+    state.pc = pc;
+    renderPc();
+  } catch (e) { $('pc-info').innerHTML = `<p class="muted">не удалось определить: ${esc(e.message)}</p>`; }
+}
+
+// Железо поменялось или его поправили вручную — прежние оценки недействительны
+async function pcChanged() {
+  fitCache.clear();
+  await loadPc(true);
+  annotateFits($('models'));
+  if ($('pc-scan').children.length) scanPc();
+  if (state.model) pickModel();
+}
+
+async function scanPc() {
+  const btn = $('btn-pc-scan');
+  busy(btn, true, 'проверяю…');
+  const box = $('pc-scan');
+  box.innerHTML = '';
+  try {
+    const lists = await Promise.all(Object.values(TOP_KINDS).map((kind) =>
+      api('/api/top?' + new URLSearchParams({ fmt: 'gguf', kind }))));
+    const seen = new Set();
+    const items = [];
+    lists.forEach((l) => l.families.forEach((fam) => fam.models.forEach((m) => m.variants.forEach((v) => {
+      if (v.format !== 'gguf' || seen.has(v.repo_id)) return;
+      seen.add(v.repo_id);
+      items.push({ title: m.title, repo: v.repo_id });
+    }))));
+    let done = 0;
+    const note = () => { $('pc-scan-note').textContent = `проверено ${done} из ${items.length}`; };
+    note();
+    const res = await Promise.all(items.map((it) => fetchFit(it.repo)
+      .then((f) => { done++; note(); return { ...it, fit: f }; })));
+    const groups = [
+      ['gpu', 'Целиком в видеокарте — быстро'],
+      ['moe', 'С экспертами в оперативке — средне'],
+      ['partial', 'Часть слоёв в оперативке — медленно'],
+      ['cpu', 'Только на процессоре — очень медленно'],
+      ['unknown', 'Не удалось проверить'],
+    ];
+    groups.forEach(([st, title]) => {
+      const rows = res.filter((r) => r.fit.status === st);
+      if (!rows.length) return;
+      const g = el('div', 'pc-group', `<h3>${esc(title)} · ${rows.length}</h3>`);
+      rows.forEach((r) => {
+        const row = el('div', 'variant');
+        row.innerHTML = `${fitBadge(r.fit)}<b>${esc(r.title)}</b>
+          <code class="repo">${esc(r.repo)}</code>
+          <span class="muted">${esc(r.fit.text || '')}</span>
+          <button class="primary">Выбрать</button>`;
+        row.querySelector('button').onclick = () => {
+          $('model-ref').value = r.repo;
+          document.querySelector('.tab[data-tab="model"]').click();
+          pickModel();
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        };
+        g.appendChild(row);
+      });
+      box.appendChild(g);
+    });
+    const fits = res.filter((r) => !['no', 'unknown'].includes(r.fit.status)).length;
+    const noFit = res.filter((r) => r.fit.status === 'no').length;
+    if (!fits) box.innerHTML = '<p class="muted">Из подборки на этот ПК ничего не влезает.</p>';
+    $('pc-scan-note').textContent = `влезает ${fits} из ${items.length}` +
+      (noFit ? ` · ещё ${noFit} слишком большие для этого ПК — скрыты` : '');
+  } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
+  finally { busy(btn, false); }
+}
+
+function setWhere(w) {
+  state.where = w;
+  localStorage.setItem('where', w);
+  document.body.classList.toggle('mode-pc', w === 'pc');
+  document.querySelectorAll('#where button').forEach((b) => b.classList.toggle('on', b.dataset.where === w));
+  // открытая вкладка могла исчезнуть вместе с режимом — возвращаемся к выбору модели
+  const active = document.querySelector('.tab.active');
+  if (active && getComputedStyle(active).display === 'none') document.querySelector('.tab[data-tab="model"]').click();
+  if (w === 'pc') {
+    if (!state.pc) loadPc();
+    loadLocal();
+    pollLocal();
+    annotateFits($('models'));
+  }
+  if (state.model) pickModel();   // карточка и выбор кванта зависят от режима
+}
+
+// ───────── Claude Code / Claude Desktop ─────────
+// where: local | clore. Результат показываем прямо под кнопками — там нужны пути и значения.
+async function claudeTo(target, where, box, btn) {
+  busy(btn, true, '…');
+  try {
+    const r = await api('/api/claude', { target, where });
+    const copy = (v) => `<code class="copy" data-copy="${esc(v)}">${esc(v)}</code>`;
+    if (target === 'cli') {
+      box.innerHTML = `<div class="explain-body" style="margin-top:10px">
+        <p><b>Готово.</b> В терминале запускайте <code>${esc(r.command)}</code> вместо <code>claude</code> —
+          Claude Code заработает на этой модели. Обычный <code>claude</code> с вашей подпиской не изменился.</p>
+        <p class="muted">Команда: ${copy(r.paths[0])}. Сменили модель или сервер — нажмите кнопку ещё раз.
+          Проверить, куда он ходит: команда <code>/status</code> внутри Claude Code (строка Anthropic base URL).</p>
+        ${(r.warnings || []).map((w) => `<p class="warn-text">⚠ ${esc(w)}</p>`).join('')}
+        <p class="muted">Anthropic не поддерживает Claude Code с не-Claude моделями: что-то может работать
+          хуже — особенно у маленьких моделей вызовы инструментов.</p></div>`;
+    } else {
+      box.innerHTML = `<div class="explain-body" style="margin-top:10px">
+        <p><b>Claude Desktop настроен.</b> Модель «${esc(r.label)}» прописана как сторонний провайдер
+          (конфигурация «${esc(r.entry)}»). Осталось:</p>
+        <ol>
+          <li><b>Полностью закройте Claude Desktop</b> — ☰ → File → Exit (крестик только сворачивает в трей)
+            — и откройте снова.</li>
+          <li>Если он откроется на экране входа — выберите вход через стороннего провайдера,
+            а не аккаунт Anthropic.</li>
+        </ol>
+        ${(r.warnings || []).map((w) => `<p class="warn-text">⚠ ${esc(w)}</p>`).join('')}
+        <p class="muted">Это отдельный режим Desktop со своей историей: чаты вашего аккаунта claude.ai там
+          не видны. Вернуться к обычному Claude — выбрать вход через Anthropic на экране входа, или убрать
+          настройку совсем кнопкой ниже. Desktop считает окно незнакомой модели равным 200 тыс. токенов —
+          длинный разговор упрётся в реальный контекст модели ошибкой. Cowork требует включённой
+          виртуализации Windows.</p>
+        <p class="muted">Desktop принимает только модели с именем Claude, поэтому для него у модели второе имя —
+          <code>${esc(r.model)}</code>: так он считает её Sonnet 4.5. Это обход его проверки, Anthropic такое не
+          поддерживает: часть функций (thinking, effort) может не работать, а обновление Desktop — сломать настройку.</p>
+        <p class="muted">Адрес ${copy(r.base_url)} · модель ${copy(r.model)} · файлы: <code>${esc(r.dir)}</code></p>
+        <button class="ghost" data-desktop-off>Убрать из Claude Desktop</button>
+      </div>`;
+      box.querySelector('[data-desktop-off]').onclick = async (e) => {
+        try {
+          const x = await api('/api/claude/desktop-off', {});
+          box.innerHTML = `<p class="muted">${x.removed ? 'Настройка убрана' : 'Нашей настройки там уже нет'} —
+            перезапустите Claude Desktop.</p>`;
+        } catch (err) { toast(err.message, true); }
+      };
+    }
+    box.querySelectorAll('.copy').forEach((n) => (n.onclick = () => {
+      navigator.clipboard.writeText(n.dataset.copy || ''); toast('скопировано');
+    }));
+  } catch (e) { toast(e.message, true); } finally { busy(btn, false); }
+}
+
+// ───────── запуск на своём ПК ─────────
+const ISO_NAME = { native: 'обычный (ограниченные права)', docker: 'Docker' };
+const IL_NAME = { low: 'Low ✓', medium: 'Medium — понижение не сработало', high: 'High — запущено от администратора!' };
+
+async function installLocal() {
+  const m = state.model;
+  if (!m) return toast('сначала выберите модель', true);
+  const row = (m.local?.options || []).find((r) => r.path === state.gguf_file) || m.local?.best;
+  if (!row?.mode) return toast('этот квант на этот ПК не влезает — выберите другой', true);
+  if (!confirm(`Скачать и запустить ${m.repo_id}\n${row.label} — ${row.weights_gib} ГиБ, ` +
+    `${MODE_NAME[row.mode]}, контекст ${fmtCtx(row.ctx)}\nИзоляция: ${ISO_NAME[$('local-iso').value]}`)) return;
+  try {
+    await api('/api/local/run', { ref: m.repo_id, gguf_file: row.path, ctx: $('model-ctx').value || '',
+      isolation: $('local-iso').value });
+    document.querySelector('.tab[data-tab="pc"]').click();
+    pollLocal();
+    toast('установка началась — лог на вкладке «Мой ПК»');
+  } catch (e) { toast(e.message, true); }
+}
+
+function renderLocal(s) {
+  const r = s.run || {};
+  const box = $('local-run');
+  const iso = r.isolation_check;
+  const dockerOpt = $('local-iso').querySelector('option[value="docker"]');
+  dockerOpt.disabled = !s.docker?.ok;
+  dockerOpt.textContent = s.docker?.ok ? 'Docker (максимальная изоляция, нужен Docker Desktop)'
+    : `Docker (максимальная изоляция) — ${s.docker?.why || 'недоступен'}`;
+  if (!s.docker?.ok && $('local-iso').value === 'docker') $('local-iso').value = 'native';
+  $('local-iso-note').innerHTML = $('local-iso').value === 'docker'
+    ? 'Сильнее изолирован: даже обход ограничений процесса оставит атакующего внутри виртуальной машины Docker.'
+    : 'Ставить ничего не нужно. Скорость полная. Файлы — в <code>' + esc(s.dir) + '</code>.';
+  if (!r.running) {
+    box.innerHTML = '<p class="muted">Модель на этом ПК не запущена. Выберите модель на вкладке «Модель» — ' +
+      'в карточке появится кнопка «Поставить на этот ПК».</p>';
+  } else {
+    const fw = s.firewall;
+    box.innerHTML = `<div class="grid">
+        <div class="kv"><b>${esc(r.repo)}</b><span>${esc(r.file)}</span></div>
+        <div class="kv"><b>${r.ready ? 'отвечает' : 'загружается…'}</b><span>состояние</span></div>
+        <div class="kv"><b>${fmtCtx(r.ctx)}</b><span>контекст · ${esc(MODE_NAME[r.mode] || r.mode || '')}</span></div>
+        <div class="kv"><b>${esc(ISO_NAME[r.isolation] || r.isolation)}</b><span>изоляция</span></div>
+        ${iso ? `<div class="kv"><b class="${iso.integrity === 'low' ? '' : 'warn-text'}">${esc(IL_NAME[iso.integrity] || iso.integrity)}</b>
+          <span>уровень целостности</span></div>
+        <div class="kv"><b class="${iso.in_job ? '' : 'warn-text'}">${iso.in_job ? 'да ✓' : 'нет!'}</b>
+          <span>в Job Object (без дочерних процессов)</span></div>` : ''}
+        ${s.windows && r.isolation === 'native' ? `<div class="kv"><b class="${fw ? '' : 'warn-text'}">${fw ? 'закрыт ✓' : 'открыт'}</b>
+          <span>выход в интернет</span></div>` : ''}
+      </div>
+      <p class="muted" style="margin:8px 0 0">Base URL: <code class="copy" data-copy="${esc(r.url)}">${esc(r.url)}</code>
+        · модель <code>uncensored</code> · ключ ${esc(r.key_hint)} (полностью — в конфиг OpenCode кнопкой ниже)</p>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" id="btn-local-bench">Замерить скорость</button>
+        <button class="ghost" id="btn-local-oc">Прописать в OpenCode</button>
+        <button class="ghost" id="btn-local-cc" title="Создать команду claude-uncensored: Claude Code на этой модели. Обычный claude не меняется">Claude Code</button>
+        <button class="ghost" id="btn-local-cd" title="Прописать модель в Claude Desktop (режим стороннего провайдера)">Claude Desktop</button>
+        ${s.windows && r.isolation === 'native' && !fw ? '<button class="ghost" id="btn-local-fw" title="Правило брандмауэра Windows: llama-server не сможет ничего отправить в интернет. Windows спросит права администратора">Закрыть ему интернет</button>' : ''}
+      </div>
+      <div id="local-claude"></div>`;
+    $('btn-local-cc').onclick = (e) => claudeTo('cli', 'local', $('local-claude'), e.target);
+    $('btn-local-cd').onclick = (e) => claudeTo('desktop', 'local', $('local-claude'), e.target);
+    box.querySelectorAll('.copy').forEach((n) => (n.onclick = () => {
+      navigator.clipboard.writeText(n.dataset.copy || ''); toast('скопировано');
+    }));
+    $('btn-local-bench').onclick = async (e) => {
+      busy(e.target, true, 'гоняю…');
+      try {
+        const x = await api('/api/local/bench', {});
+        toast(x.tokens_per_sec ? `${x.tokens_per_sec.toFixed(0)} ток/с` : 'замер не удался', !x.tokens_per_sec);
+      } catch (err) { toast(err.message, true); } finally { busy(e.target, false); }
+    };
+    $('btn-local-oc').onclick = async (e) => {
+      busy(e.target, true, 'пишу…');
+      try {
+        const { paths } = await api('/api/local/opencode', {});
+        toast('OpenCode переключён на модель этого ПК: ' + paths[0]);
+      } catch (err) { toast(err.message, true); } finally { busy(e.target, false); }
+    };
+    if ($('btn-local-fw')) {
+      $('btn-local-fw').onclick = async () => {
+        try {
+          await api('/api/local/firewall', {});
+          toast('подтвердите запрос Windows — потом статус обновится');
+          setTimeout(loadLocal, 6000);
+        } catch (err) { toast(err.message, true); }
+      };
+    }
+  }
+  const ms = s.models || [];
+  $('local-models').innerHTML = ms.length ? '' : `<p class="muted">Пока ничего. Каталог: <code>${esc(s.dir)}</code></p>`;
+  ms.forEach((m) => {
+    const row = el('div', 'variant');
+    row.innerHTML = `<b>${esc(m.repo)}</b><span class="muted">${m.files.map(esc).join(', ')} · ${m.gib} ГиБ</span>
+      <button class="danger">Удалить</button>`;
+    row.querySelector('button').onclick = async () => {
+      if (!confirm(`Удалить ${m.repo} (${m.gib} ГиБ) с диска?`)) return;
+      try { await api('/api/local/delete', { repo: m.repo }); loadLocal(); } catch (e) { toast(e.message, true); }
+    };
+    $('local-models').appendChild(row);
+  });
+}
+
+async function loadLocal() {
+  try { renderLocal(await api('/api/local/status')); } catch (e) { $('local-run').innerHTML = `<p class="muted">${esc(e.message)}</p>`; }
+}
+
+let localPoll = null;
+function pollLocal() {
+  clearInterval(localPoll);
+  const tick = async () => {
+    try {
+      const j = await api('/api/local/job');
+      if (j.log.length) {
+        $('local-log').textContent = j.log.join('\n');
+        $('local-log').scrollTop = $('local-log').scrollHeight;
+      }
+      $('local-elapsed').textContent = j.running ? `· идёт ${Math.floor(j.elapsed / 60)} мин ${j.elapsed % 60} с` : '';
+      if (!j.running) {
+        clearInterval(localPoll);
+        localPoll = null;
+        if (j.error) toast('не запустилось: ' + j.error, true);
+        else if (j.result?.status === 'ready') toast('модель на этом ПК готова');
+        loadLocal();
+      }
+    } catch (e) { /* один неудачный опрос — не повод ломать страницу */ }
+  };
+  tick();
+  localPoll = setInterval(tick, 2000);
+}
+
 // ───────── привязка ─────────
 $('btn-pick').onclick = pickModel;
 $('model-ref').addEventListener('keydown', (e) => { if (e.key === 'Enter') pickModel(); });
@@ -789,6 +1202,8 @@ $('btn-opencode').onclick = async () => {
   } catch (e) { toast(e.message, true); }
   finally { busy($('btn-opencode'), false); }
 };
+$('btn-claude-cli').onclick = (e) => claudeTo('cli', 'clore', $('clore-claude'), e.target);
+$('btn-claude-desktop').onclick = (e) => claudeTo('desktop', 'clore', $('clore-claude'), e.target);
 $('btn-offers').onclick = loadOffers;
 $('f-cpu-moe').onchange = () => { applyNeed(); loadOffers(); };
 // Фильтр применяется к уже загруженному списку — поэтому мгновенно и без запроса к Clore
@@ -798,6 +1213,14 @@ $('order-type').onchange = renderPlan;
 $('btn-deploy').onclick = () => startDeploy(false);
 $('btn-dry').onclick = () => startDeploy(true);
 $('btn-cancel').onclick = () => cancelOrder();
+$('d-race').onchange = renderPlan;
+$('btn-job-stop').onclick = async () => {
+  if (!confirm('Остановить деплой? Заказы, которые он успел арендовать, будут отменены.')) return;
+  try {
+    await api('/api/deploy/stop', {});
+    toast('останавливаю — отменяю арендованные серверы');
+  } catch (e) { toast(e.message, true); }
+};
 $('btn-orders').onclick = loadOrders;
 $('btn-wallets').onclick = loadWallets;
 $('btn-save').onclick = saveSettings;
@@ -817,6 +1240,30 @@ $('btn-bench').onclick = async () => {
   } catch (e) { toast(e.message, true); }
   finally { busy($('btn-bench'), false); }
 };
+
+document.querySelectorAll('#where button').forEach((b) => { b.onclick = () => setWhere(b.dataset.where); });
+$('btn-pc-refresh').onclick = () => pcChanged().then(() => toast('железо опрошено заново'));
+$('btn-pc-scan').onclick = scanPc;
+$('local-iso').onchange = () => { localStorage.setItem('iso', $('local-iso').value); loadLocal(); };
+if (localStorage.getItem('iso')) $('local-iso').value = localStorage.getItem('iso');
+$('btn-local-stop').onclick = async () => {
+  try {
+    const r = await api('/api/local/stop', {});
+    toast(r.stopped ? 'модель остановлена' : 'остановлено');
+    loadLocal();
+  } catch (e) { toast(e.message, true); }
+};
+$('btn-pc-save').onclick = async () => {
+  busy($('btn-pc-save'), true, 'сохраняю…');
+  try {
+    await api('/api/settings', { PC_VRAM_GB: $('s-PC_VRAM_GB').value.trim(), PC_RAM_GB: $('s-PC_RAM_GB').value.trim() });
+    await loadState();
+    await pcChanged();
+    toast('поправка сохранена');
+  } catch (e) { toast(e.message, true); }
+  finally { busy($('btn-pc-save'), false); }
+};
+setWhere(state.where);
 
 loadState().then(searchModels).catch((e) => toast(e.message, true));
 pollJob();
