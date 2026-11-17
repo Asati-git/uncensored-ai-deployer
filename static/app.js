@@ -18,13 +18,18 @@ const OFFERS_SHOWN = 30;
 // Сколько серверов можно поставить в очередь аренды. Деплой пробует их по порядку:
 // не поднялся первый — берётся следующий. Предел тот же, что в deploy.py.
 const MAX_PICK = 10;
-const TOP_KINDS = { uncensored: 'uncensored', top: 'top' };
+const TOP_KINDS = { uncensored: 'uncensored', top: 'top', eco: 'eco' };
 const state = { model: null, offers: [], env: null, polling: null, period: 'uncensored', gguf_file: '',
   // где запускать: 'clore' — аренда сервера, 'pc' — этот компьютер. Запоминаем между сессиями
   // ссылка /#pc открывает сразу режим ПК — удобно для закладки
   where: (location.hash === '#pc' || localStorage.getItem('where') === 'pc') ? 'pc' : 'clore', pc: null };
 
 const PERIOD_NOTE = {
+  eco: 'Небольшие модели для домашнего ПК, разложенные по объёму видеопамяти: от ноутбука без ' +
+       'видеокарты до одной карты на 24 ГБ. У каждой базы — расцензуренная сборка и, где она есть, ' +
+       'обычная от проверенного квантователя. Чем меньше модель, тем хуже она держит длинные ' +
+       'задачи и вызовы инструментов — что от какого размера ждать, написано в группах. ' +
+       '<b>В режиме «Мой ПК» показаны только модели, которые запустятся на этой сборке.</b>',
   uncensored: 'Модели, где цензуру сносили агрессивнее всего — дообучением либо хирургией по весам, ' +
        'с публичными замерами доли отказов. Абляция, на которой построен «Топ для кодинга», снимает ' +
        'большинство отказов, но не все. Это сборки одиночек: бенчмарки в карточках — замеры самих авторов.',
@@ -840,11 +845,44 @@ function annotateFits(root) {
     if (slot.dataset.format !== 'gguf') {
       slot.innerHTML = fitBadge({ status: 'need_gguf',
         text: 'локально запускается llama.cpp — ищите GGUF-сборку этой модели' });
+      slot.dataset.status = 'need_gguf';
       return;
     }
     slot.innerHTML = fitBadge(null);
-    fetchFit(slot.dataset.ref).then((f) => { slot.innerHTML = fitBadge(f); });
+    fetchFit(slot.dataset.ref).then((f) => {
+      slot.innerHTML = fitBadge(f);
+      slot.dataset.status = f.status;
+      pruneUnfit(root);
+    });
   });
+}
+
+// «Экономные» в режиме ПК — это ответ на вопрос «что поставить на эту машину», поэтому
+// модели, которые на неё не влезут, здесь не показываем вовсе: сначала вариант, потом
+// модель без вариантов, потом группу без моделей.
+function pruneUnfit(root) {
+  if (state.where !== 'pc' || state.period !== 'eco') return;
+  root.querySelectorAll('.vwrap').forEach((w) => {
+    const st = w.querySelector('.fit-slot')?.dataset.status;
+    w.classList.toggle('hidden', st === 'no' || st === 'need_gguf');
+  });
+  root.querySelectorAll('.tmodel').forEach((m) => {
+    const dead = !m.querySelector('.vwrap:not(.hidden)');
+    (m.closest('details.tfold') || m).classList.toggle('hidden', dead);
+  });
+  let hidden = 0;
+  root.querySelectorAll('.item.top').forEach((it) => {
+    const models = [...it.querySelectorAll('.tmodel')];
+    const dead = models.filter((m) => (m.closest('details.tfold') || m).classList.contains('hidden'));
+    hidden += dead.length;
+    it.classList.toggle('hidden', models.length > 0 && dead.length === models.length);
+  });
+  let note = root.querySelector('.unfit-note');
+  if (!note) { note = el('p', 'muted unfit-note'); root.appendChild(note); }
+  const pending = root.querySelectorAll('.fit-slot:not([data-status])').length;
+  note.textContent = pending ? `проверяю, что влезет на этот ПК… осталось ${pending}`
+    : hidden ? `Ещё ${hidden} ${plural(hidden, 'модель', 'модели', 'моделей')} из подборки на этот ПК не влезут — скрыты.`
+      : '';
 }
 
 // значок режима перед квантом в выпадающем списке
@@ -985,7 +1023,13 @@ function setWhere(w) {
     if (!state.pc) loadPc();
     loadLocal();
     pollLocal();
-    annotateFits($('models'));
+    // На своём ПК первым делом нужен ответ «что сюда поставить» — открываем «Экономные».
+    // Если человек уже сам выбрал другой список, не трогаем.
+    if (!state.periodPicked && state.period !== 'eco') setPeriod('eco');
+    else if (state.period === 'eco' && state.booted) searchModels();
+    else annotateFits($('models'));
+  } else if (state.period === 'eco' && state.booted) {
+    searchModels();                 // вернуть скрытые модели: на сервере влезает всё
   }
   if (state.model) pickModel();   // карточка и выбор кванта зависят от режима
 }
@@ -1197,11 +1241,15 @@ $('to-formats').onclick = (e) => {
 };
 $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchModels(); });
 $('fmt').onchange = searchModels;
+function setPeriod(p) {
+  state.period = p;
+  document.querySelectorAll('#periods button').forEach((n) => n.classList.toggle('on', n.dataset.period === p));
+  if (state.booted) searchModels();
+}
 document.querySelectorAll('#periods button').forEach((b) => {
   b.onclick = () => {
-    state.period = b.dataset.period;
-    document.querySelectorAll('#periods button').forEach((n) => n.classList.toggle('on', n === b));
-    searchModels();
+    state.periodPicked = true;      // человек выбрал список сам — режим его больше не переключает
+    setPeriod(b.dataset.period);
   };
 });
 $('btn-opencode').onclick = async () => {
@@ -1280,5 +1328,5 @@ $('btn-pc-save').onclick = async () => {
 };
 setWhere(state.where);
 
-loadState().then(searchModels).catch((e) => toast(e.message, true));
+loadState().then(() => { state.booted = true; return searchModels(); }).catch((e) => toast(e.message, true));
 pollJob();

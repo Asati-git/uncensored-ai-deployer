@@ -241,7 +241,8 @@ def api_get(path, q):
             token=token)
 
     if path == "/api/top":
-        # kind: 'uncensored' — подборка максимально расцензуренных, 'top' — кодеры
+        # kind: 'uncensored' — подборка максимально расцензуренных, 'top' — кодеры,
+        # 'eco' — небольшие модели для домашнего ПК по классам видеопамяти
         return hfmodels.top_coding(fmt=(q.get("fmt") or [""])[0] or None,
                                    kind=(q.get("kind") or [""])[0] or hfmodels.DEFAULT_TOP,
                                    token=token)
