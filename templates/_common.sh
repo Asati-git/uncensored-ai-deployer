@@ -187,13 +187,52 @@ install_hf() {
 # тишина. Поэтому контейнер сам отдаёт стадию и объём скачанного на отдельном порту.
 stage() { echo "$1" > /root/.stage 2>/dev/null; }
 
+# Ошибка установки не должна выглядеть как «всё ещё ставится». Раньше после exit 1 стадия
+# оставалась прежней, а фоновое скачивание весов шло дальше: сервер час качал модель,
+# которую уже некому запускать, и всё это время оплачивался.
+fail_trap() {
+  local rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  { set +x; } 2>/dev/null   # трассировка самой ловушки вытесняла из хвоста лога причину
+  echo "[setup] установка прервана с ошибкой (код ${rc})"
+  sleep 1   # даём tee дописать лог, из которого берём причину
+  grep -a 'ОШИБКА' /root/deploy.log 2>/dev/null | grep -av '^+' | tail -n 1 | cut -c1-300 > /root/.fail
+  # явного сообщения нет — берём последнюю содержательную строку перед выходом
+  [ -s /root/.fail ] || grep -av -e '^+' -e 'установка прервана' /root/deploy.log 2>/dev/null     | tail -n 1 | cut -c1-300 > /root/.fail
+  stage failed
+  if [ -n "${DLPID:-}" ]; then
+    pkill -P "${DLPID}" 2>/dev/null
+    kill "${DLPID}" 2>/dev/null
+  fi
+}
+trap fail_trap EXIT
+
 start_status() {
   command -v python3 >/dev/null 2>&1 || return 0
-  [ -f /root/.status_up ] && return 0
+  # проверяем сам процесс, а не файл-маркер: маркер переживал перезапуск контейнера,
+  # процесс — нет, и после рестарта статус-порт уже не поднимался
+  pgrep -f "[s]tatus.py" >/dev/null 2>&1 && return 0
   cat > /root/status.py <<'PYSTATUS'
-import http.server, json, os
+import http.server, json, os, subprocess
 D = os.environ.get("MODEL_DIR") or "/root/models"
+
+def cpu():
+    # Процессорное время всех процессов контейнера, шагом в 10 секунд. Это и есть
+    # признак работы: pip, сборка и загрузка весов в VRAM могут минутами ничего не
+    # писать в лог, но процессор при этом занят. Зависший процесс его не тратит.
+    t = 0
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                f = open("/proc/%s/stat" % p).read().rsplit(")", 1)[1].split()
+                t += int(f[11]) + int(f[12])
+            except (OSError, IndexError, ValueError):
+                pass
+    return t // (os.sysconf("SC_CLK_TCK") * 10)
+
 class H(http.server.BaseHTTPRequestHandler):
+    timeout = 10      # молчащее соединение (сканер портов) не должно вешать сервер
+
     def do_GET(self):
         n = 0
         for root, _, files in os.walk(D):
@@ -206,20 +245,32 @@ class H(http.server.BaseHTTPRequestHandler):
             st = open("/root/.stage").read().strip()
         except OSError:
             st = "setup"
-        # «пульс»: растёт, пока контейнер чем-то занят (сборка, загрузка в VRAM) —
-        # по нему деплой отличает долгую работу от зависания
+        try:
+            fail = open("/root/.fail").read().strip() if st == "failed" else ""
+        except OSError:
+            fail = ""
+        # «пульс»: меняется, пока контейнер чем-то занят — по нему деплой отличает долгую
+        # работу от зависания. Лог движка сюда не входит: в него попадает каждый запрос
+        # к API, в том числе наши же проверки готовности, и застой был бы не виден.
         beat = 0
-        for p in ("/root/deploy.log", "/root/engine.log", "/root/download.log"):
+        for p in ("/root/deploy.log", "/root/download.log"):
             try:
                 beat += os.path.getsize(p)
             except OSError:
                 pass
         try:
-            gpu = sum(int(x) for x in os.popen("nvidia-smi --query-gpu=memory.used "
-                      "--format=csv,noheader,nounits 2>/dev/null").read().split())
-        except ValueError:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
+                                  "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            gpu = sum(int(x) for x in out.split())
+        except Exception:
             gpu = 0
-        body = json.dumps({"stage": st, "bytes": n, "beat": beat, "gpu": gpu}).encode()
+        try:
+            c = cpu()
+        except Exception:
+            c = 0
+        body = json.dumps({"stage": st, "bytes": n, "beat": beat, "gpu": gpu,
+                           "cpu": c, "fail": fail}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -229,10 +280,9 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-http.server.HTTPServer(("0.0.0.0", int(os.environ.get("STATUS_PORT") or 5001)),
-                       H).serve_forever()
+http.server.ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("STATUS_PORT") or 5001)),
+                                H).serve_forever()
 PYSTATUS
   MODEL_DIR="${MODEL_DIR}" STATUS_PORT="__STATUS_PORT__" \
     setsid nohup python3 /root/status.py >/dev/null 2>&1 &
-  touch /root/.status_up
 }

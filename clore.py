@@ -8,6 +8,7 @@ https://clore.ai -> Settings -> API.
 Лимиты Clore: 1 запрос/с на большинство эндпоинтов и 1 запрос/5 с на create_order —
 клиент сам выдерживает паузы, чтобы не получить code 5.
 """
+import http.client
 import json
 import re
 import threading
@@ -101,20 +102,30 @@ class Clore:
                     out = json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
                 payload = e.read().decode(errors="replace")[:300]
-                gateway = e.code in (502, 503, 504)
+                # любой 5xx не говорит, выполнился ли запрос на стороне Clore
+                gateway = e.code >= 500
                 # 429 — запрос отвергнут, повторять можно всегда. Ошибка шлюза не говорит,
                 # дошёл ли запрос до бэкенда, поэтому create_order на ней не повторяем
-                if (e.code == 429 or (gateway and safe)) and attempt < retries - 1:
+                if (e.code == 429 or (e.code in (502, 503, 504) and safe)) and attempt < retries - 1:
                     # 429 прилетает, когда к аккаунту обращаются сразу несколько деплоев;
                     # пауза по секунде тут не помогает — ждём ощутимо дольше
                     time.sleep((5 if e.code == 429 else 1) * (2 ** attempt))
                     continue
                 raise CloreError(1, f"HTTP {e.code}: {payload}", uncertain=gateway and not safe)
-            except (urllib.error.URLError, TimeoutError) as e:
+            except (OSError, http.client.HTTPException, ValueError) as e:
+                # Сюда попадает всё, что случается уже ПОСЛЕ отправки запроса: сброс
+                # соединения на чтении ответа, оборванное тело, HTML вместо JSON. Раньше
+                # такие ошибки летели мимо CloreError — и деплой падал, не записав номер
+                # только что созданного заказа, а отмена обрывалась на полпути.
                 if safe and attempt < retries - 1:
                     time.sleep(2 ** attempt)
                     continue
-                raise CloreError(1, f"сеть: {e}", uncertain=not safe)
+                raise CloreError(1, f"сеть: {e.__class__.__name__}: {e}", uncertain=not safe)
+            if not isinstance(out, dict):
+                if safe and attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise CloreError(1, "ответ Clore не разобрать", uncertain=not safe)
 
             code = out.get("code", 0)
             if code == 5 and attempt < retries - 1:

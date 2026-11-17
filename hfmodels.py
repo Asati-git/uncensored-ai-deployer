@@ -1107,6 +1107,11 @@ def model_info(ref, ctx=None, token=None):
     meta = _get(f"models/{urllib.parse.quote(repo_id)}", token)
     tags = [str(t) for t in (meta.get("tags") or [])]
     entries = _tree(repo_id, token)
+    if not entries:
+        # _tree глотает сбой HF (429, таймаут) и возвращает пустой список. Считать по нему
+        # нельзя: модель без файлов выглядела как «не влезет даже самый лёгкий квант», и
+        # этот ответ кешировался на полчаса
+        raise RuntimeError(f"HuggingFace не отдал список файлов {repo_id} — повторите через минуту")
     files = [str(e.get("path")) for e in entries if e.get("type") == "file"]
 
     fmt = detect_format(repo_id, tags, files)
@@ -1120,6 +1125,8 @@ def model_info(ref, ctx=None, token=None):
     cfg = _config_with_base(repo_id, meta, own_cfg, token)
     ctx_max = model_max_ctx(cfg)
     ctx = int(ctx) if ctx else min(ctx_max or DEFAULT_CTX, CTX_CAP)
+    if ctx_max:
+        ctx = min(ctx, ctx_max)      # больше, чем умеет модель, движок всё равно не даст
     vocab = int(cfg.get("vocab_size") or 0)
 
     kv_gib = kv_cache_gib(cfg, ctx, engine)

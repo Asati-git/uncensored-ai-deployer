@@ -276,7 +276,7 @@
     <div id="plan" class="plan"></div>
     <div class="row filters">
       <label>Docker-образ<input id="d-image" type="text" placeholder="по умолчанию — под движок"></label>
-      <label>SSH-пароль<input id="d-ssh" type="text" placeholder="по умолчанию — из ключа API"></label>
+      <label>SSH-пароль<input id="d-ssh" type="text" placeholder="по умолчанию — случайный, в .env"></label>
       <label class="check"><input id="d-force" type="checkbox"> арендовать ещё один сервер</label>
       <label class="check" title="Арендует все выбранные серверы сразу и ставит модель на каждом. Остаётся тот, где она поднялась первой, остальные отменяются; заметно отстающие по скорости скачивания — ещё по ходу. Clore считает аренду поминутно, так что проигравшие стоят минуты"><input id="d-race" type="checkbox"> ставить параллельно на все выбранные — оставить самый быстрый</label>
     </div>

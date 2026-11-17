@@ -1,4 +1,6 @@
 .env
+.env.lock
+.env.tmp
 onstart.generated.sh
 __pycache__/
 *.pyc

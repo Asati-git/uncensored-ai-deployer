@@ -2,7 +2,6 @@
 # safetensors (fp16 / AWQ / GPTQ / FP8) -> vLLM (OpenAI-совместимый API на порту __PORT__)
 # Параметры из env заказа Clore: MODEL_REPO, MODEL_NAME, API_KEY, HF_TOKEN, CTX, QUANT
 exec > >(tee -a /root/deploy.log >/dev/null) 2>&1
-set -x
 export DEBIAN_FRONTEND=noninteractive
 cd /root
 
@@ -14,6 +13,10 @@ QUANT="${QUANT:-__QUANT__}"
 TOOL_PARSER="${TOOL_PARSER:-__TOOL_PARSER__}"
 PORT="__PORT__"
 MODEL_DIR="/root/models/${MODEL_NAME}"
+
+# Трассировку включаем только здесь: выше присваиваются ключи, и с set -x они
+# попадали бы в /root/deploy.log, а оттуда — в лог деплоя на вашем ПК
+set -x
 
 __COMMON__
 
@@ -28,7 +31,7 @@ if [ ! -f /root/.setup_done ]; then
   stage download
 
   mkdir -p "${MODEL_DIR}"
-  ( export HF_TOKEN="${HF_TOKEN}"; export HF_HUB_ENABLE_HF_TRANSFER=1; export HF_XET_HIGH_PERFORMANCE=1
+  ( set +x; export HF_TOKEN="${HF_TOKEN}"; export HF_HUB_ENABLE_HF_TRANSFER=1; export HF_XET_HIGH_PERFORMANCE=1
     hf_download "${MODEL_REPO}" --local-dir "${MODEL_DIR}" >> /root/download.log 2>&1
     touch /root/.download_done ) &
   DLPID=$!
@@ -49,6 +52,9 @@ fi
 fix_cuda_compat
 
 GPUS=$(nvidia-smi -L | wc -l)
+# без этой проверки сбой драйвера выглядел как «движок упал на скачанных весах»,
+# то есть как проблема модели, и деплой бросал всю очередь серверов
+[ "${GPUS}" -ge 1 ] || { echo "[setup] ОШИБКА: nvidia-smi не видит ни одной карты"; exit 1; }
 # tensor-parallel должен быть степенью двойки и делить число GPU (иначе vLLM не стартует),
 # остальные карты добираем pipeline-параллелизмом — так задействуются все GPU при 3, 5, 6, 12…
 TP=1
@@ -88,6 +94,7 @@ if [ -z "${TOOL_PARSER}" ] || ! vllm serve --help=all 2>/dev/null | grep -q -- "
   TOOL_PARSER="hermes"
 fi
 stage engine
+{ set +x; } 2>/dev/null   # дальше без трассировки: в команде ключ API
 setsid nohup vllm serve "${MODEL_DIR}" \
   --served-model-name "${MODEL_NAME}" "${MODEL_NAME}/claude-sonnet-4-5" \
   --host 0.0.0.0 --port "${PORT}" \
@@ -99,4 +106,5 @@ setsid nohup vllm serve "${MODEL_DIR}" \
   --gpu-memory-utilization 0.92 \
   --enable-auto-tool-choice --tool-call-parser "${TOOL_PARSER}" \
   ${QUANT_ARG} > /root/engine.log 2>&1 < /dev/null &
+set -x
 echo "ONSTART DONE $(date)"

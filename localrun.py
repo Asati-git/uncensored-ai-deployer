@@ -27,6 +27,7 @@ localrun.py — запуск модели на своём ПК: скачать l
 """
 import ctypes
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -125,6 +126,24 @@ def _fmt_gib(n):
 
 
 def download(url, dest, sha256=None, size=None, headers=None, logf=print, stop=None, label=None):
+    """
+    Обрыв связи посреди файла на 20–100 ГиБ — обычное дело. Раньше он ронял всю установку,
+    и докачка начиналась только после ручного повтора; теперь продолжаем сами.
+    """
+    name = label or os.path.basename(dest)
+    for attempt in range(6):
+        try:
+            return _download_once(url, dest, sha256, size, headers, logf, stop, label)
+        except (OSError, http.client.HTTPException) as e:
+            if attempt == 5:
+                raise LocalError(f"{name}: связь обрывается ({e.__class__.__name__}: {e}). "
+                                 f"Запустите ещё раз — скачанное сохранено, докачка продолжится")
+            logf(f"  {name}: обрыв связи ({e.__class__.__name__}) — продолжаю с места обрыва, "
+                 f"попытка {attempt + 2} из 6")
+            time.sleep(5)
+
+
+def _download_once(url, dest, sha256=None, size=None, headers=None, logf=print, stop=None, label=None):
     """
     Скачивает с докачкой и сверяет SHA-256. Файл появляется под своим именем только
     после сверки: недокачанный или подменённый никогда не окажется на месте настоящего.
@@ -568,8 +587,15 @@ def download_model(env, repo, gguf_path, token=None, logf=print, stop=None):
     sha, files = model_files(repo, gguf_path, token)
     mdir = _model_dir(env, repo)
     total = sum(x["size"] for x in files)
-    need = sum(x["size"] for x in files
-               if not os.path.exists(os.path.join(mdir, os.path.basename(x["path"]))))
+    need = 0
+    for x in files:
+        dest = os.path.join(mdir, os.path.basename(x["path"]))
+        if os.path.exists(dest):
+            continue
+        # недокачанная часть уже лежит на диске: раньше её размер требовался повторно,
+        # и докачка последних гигабайт упиралась в «нет места»
+        part = os.path.getsize(dest + ".part") if os.path.exists(dest + ".part") else 0
+        need += max(0, x["size"] - part)
     free = shutil.disk_usage(mdir).free
     if need and free < need + 2 * 1024 ** 3:
         raise LocalError(f"на диске {_fmt_gib(free)} свободно, а нужно {_fmt_gib(need)} — "
@@ -746,7 +772,7 @@ def firewall_rule_present(exe):
         return None
     out = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", f"name={FIREWALL_RULE}",
                           "verbose"], capture_output=True, text=True, creationflags=_NO_WINDOW,
-                         encoding="utf-8", errors="replace")
+                         encoding="oem", errors="replace")   # netsh пишет в кодировке консоли
     return out.returncode == 0 and exe.lower() in out.stdout.lower()
 
 
@@ -770,9 +796,12 @@ def docker_available():
     exe = shutil.which("docker")
     if not exe:
         return {"ok": False, "why": "Docker не установлен"}
-    out = subprocess.run([exe, "info", "--format", "{{json .Runtimes}}|{{.OSType}}"],
-                         capture_output=True, text=True, timeout=20,
-                         creationflags=_NO_WINDOW if _WIN else 0)
+    try:
+        out = subprocess.run([exe, "info", "--format", "{{json .Runtimes}}|{{.OSType}}"],
+                             capture_output=True, text=True, timeout=8, encoding="utf-8",
+                             errors="replace", creationflags=_NO_WINDOW if _WIN else 0)
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "why": "Docker не отвечает (перезапустите Docker Desktop)"}
     if out.returncode != 0:
         return {"ok": False, "why": "Docker установлен, но не запущен (откройте Docker Desktop)"}
     return {"ok": True, "nvidia": "nvidia" in out.stdout or _WIN, "exe": exe}
@@ -780,7 +809,7 @@ def docker_available():
 
 def _ghcr_digest(tag):
     """Digest образа на момент запуска — запускаем по нему, а не по плавающему тегу."""
-    tok = _json(f"https://ghcr.io/token?scope=repository:ggml-org/llama.cpp:pull")["token"]
+    tok = _json("https://ghcr.io/token?scope=repository:ggml-org/llama.cpp:pull")["token"]
     req = urllib.request.Request(
         f"https://ghcr.io/v2/ggml-org/llama.cpp/manifests/{tag}", method="HEAD",
         headers={**UA, "Authorization": f"Bearer {tok}",
@@ -795,9 +824,13 @@ def _ghcr_digest(tag):
 
 
 def _docker(*args, timeout=None):
-    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout,
-                          creationflags=_NO_WINDOW if _WIN else 0, encoding="utf-8",
-                          errors="replace")
+    try:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout,
+                              creationflags=_NO_WINDOW if _WIN else 0, encoding="utf-8",
+                              errors="replace")
+    except (OSError, subprocess.SubprocessError) as e:
+        # Docker удалили или он завис: это «команда не удалась», а не падение UI
+        return subprocess.CompletedProcess(args, 1, "", f"docker недоступен: {e}")
 
 
 # ---------- запуск ----------
@@ -902,8 +935,10 @@ def start(env, repo, model_path, ctx, fit, isolation, backend, exe=None, logf=pr
     log_path = os.path.join(data_dir(env), "llama.log")
     st = {"repo": repo, "file": os.path.basename(model_path), "ctx": ctx, "port": port, "key": key,
           "isolation": isolation, "mode": (fit or {}).get("mode"), "started": int(time.time()),
+          "vram_gib": (fit or {}).get("vram_gib") or 0,
           "log": log_path, "url": f"http://127.0.0.1:{port}/v1"}
 
+    proc = None
     if isolation == "docker":
         d = docker_available()
         if not d["ok"]:
@@ -943,11 +978,11 @@ def start(env, repo, model_path, ctx, fit, isolation, backend, exe=None, logf=pr
         if _WIN:
             flags = _NO_WINDOW | 0x4 | 0x200      # CREATE_SUSPENDED | NEW_PROCESS_GROUP
         run_dir = _sub(env, "run")
-        logf_ = open(log_path, "w", encoding="utf-8", errors="replace")
-        proc = subprocess.Popen([exe] + server_args(model_path, ctx, port, key, fit),
-                                stdout=logf_, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                cwd=run_dir, env=_clean_env(os.path.dirname(exe)),
-                                creationflags=flags, start_new_session=not _WIN)
+        with open(log_path, "w", encoding="utf-8", errors="replace") as logf_:
+            proc = subprocess.Popen([exe] + server_args(model_path, ctx, port, key, fit),
+                                    stdout=logf_, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    cwd=run_dir, env=_clean_env(os.path.dirname(exe)),
+                                    creationflags=flags, start_new_session=not _WIN)
         if _WIN:
             try:
                 _jail_windows(proc)
@@ -967,18 +1002,66 @@ def start(env, repo, model_path, ctx, fit, isolation, backend, exe=None, logf=pr
             st["ready"] = True
             save_state(env, st)
             return st
-        if not _running(st):
+        # proc.poll() обязателен: на Linux/macOS упавший дочерний процесс остаётся зомби,
+        # проверка «жив ли PID» на нём проходит, и запуск висел бы все 30 минут
+        if (proc is not None and proc.poll() is not None) or not _running(st):
             text = tail(log_path) if isolation != "docker" else _docker("logs", "--tail", "25", CONTAINER).stdout
             raise LocalError("llama-server завершился при запуске. Последние строки лога:\n" + text)
         time.sleep(3)
     raise LocalError("llama-server не ответил за 30 минут")
 
 
+def _pid_exe(pid):
+    """Имя программы под этим PID; пустая строка — узнать не удалось."""
+    try:
+        if _WIN:
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+            if not h:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(32768)
+                n = ctypes.c_ulong(len(buf))
+                return buf.value if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) else ""
+            finally:
+                k32.CloseHandle(h)
+        try:
+            with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+                return f.read().split(b"\0")[0].decode(errors="replace")
+        except OSError:
+            return subprocess.run(["ps", "-p", str(int(pid)), "-o", "comm="], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+    except Exception:  # noqa
+        return ""
+
+
+def _foreign_pid(st):
+    """
+    Истина, если под PID из run.json теперь точно другая программа. После перезагрузки
+    номера процессов раздаются заново: без проверки статус показывал «загружается» для
+    чужого процесса, а «Остановить» на Linux/macOS посылал ему сигнал завершения.
+    """
+    name = os.path.basename(_pid_exe(st.get("pid")) or "").lower()
+    want = os.path.basename(st.get("exe") or "llama-server").lower()
+    return bool(name) and name != want and not name.startswith("llama-server")
+
+
 def _running(st):
     if st.get("container"):
-        r = _docker("inspect", "-f", "{{.State.Running}}", st["container"])
+        r = _docker("inspect", "-f", "{{.State.Running}}", st["container"], timeout=15)
         return r.returncode == 0 and r.stdout.strip() == "true"
-    return _alive_pid(st.get("pid"))
+    return _alive_pid(st.get("pid")) and not _foreign_pid(st)
+
+
+def own_vram_gib(env=None):
+    """Сколько видеопамяти занимает запущенная нами модель (0 — ничего не запущено)."""
+    try:
+        st = load_state(env)
+        if st and st.get("vram_gib") and _running(st):
+            return float(st["vram_gib"])
+    except Exception:  # noqa — это справка для подбора, она не должна ничего ронять
+        pass
+    return 0.0
 
 
 def status(env=None):
@@ -1001,16 +1084,14 @@ def stop_running(env=None, logf=print):
     if st.get("container"):
         r = _docker("rm", "-f", st["container"])
         stopped = r.returncode == 0
-    elif st.get("pid") and _alive_pid(st["pid"]):
-        exe = os.path.basename(st.get("exe") or "llama-server")
+    elif st.get("pid") and _alive_pid(st["pid"]) and not _foreign_pid(st):
+        # Убиваем, только если под этим PID всё ещё llama-server, а не чужой процесс. Имя
+        # берём у системы напрямую: раньше его искали в выводе tasklist, а на русской
+        # Windows тот не читался как UTF-8 — и остановка падала, не убив ничего.
         if _WIN:
-            # убиваем только если под этим PID всё ещё llama-server, а не чужой процесс
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {st['pid']}", "/FO", "CSV", "/NH"],
-                                 capture_output=True, text=True, creationflags=_NO_WINDOW)
-            if exe.lower() in out.stdout.lower():
-                subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
-                               creationflags=_NO_WINDOW)
-                stopped = True
+            subprocess.run(["taskkill", "/PID", str(st["pid"]), "/F"], capture_output=True,
+                           creationflags=_NO_WINDOW)
+            stopped = True
         else:
             try:
                 os.kill(int(st["pid"]), 15)

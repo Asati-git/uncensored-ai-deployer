@@ -123,9 +123,12 @@ function renderCurrent() {
   // Заказы гонки, которую прервали (упал UI или компьютер): они оплачиваются, а в карточку
   // как «текущий» не попадают — без этого предупреждения про них никто бы не узнал
   const race = (c.race_orders || []);
-  const raceNote = race.length
+  const raceNote = (race.length
     ? `<p class="warn-text">⚠ Остались заказы прерванной параллельной установки: ${race.map(esc).join(', ')}.
-       Они оплачиваются — отмените их на вкладке «Заказы» (или <code>python stop.py</code>).</p>` : '';
+       Они оплачиваются — отмените их на вкладке «Заказы» (или <code>python stop.py</code>).</p>` : '')
+    + (c.pending_server
+      ? `<p class="warn-text">⚠ Деплой оборвался в момент аренды сервера ${esc(c.pending_server)}: заказ мог
+         создаться и оплачиваться. Проверьте вкладку «Заказы» (или <code>python stop.py</code>).</p>` : '');
   if (!c.order) { box.innerHTML = raceNote + '<p class="muted">Активного заказа нет.</p>'; return; }
   box.innerHTML = raceNote + `<div class="grid">
     <div class="kv"><b>${esc(c.order)}</b><span>заказ Clore</span></div>
@@ -281,9 +284,14 @@ async function pickModel() {
   busy($('btn-pick'), true, '…');
   try {
     const q = new URLSearchParams({ ref });
-    if ($('model-ctx').value) q.set('ctx', $('model-ctx').value);
+    // Поле «контекст» после выбора модели хранит ЕЁ контекст. Отправлять его можно только
+    // для той же модели (человек поправил число) — иначе контекст первой выбранной модели
+    // прилипал ко всем следующим: после модели на 32k следующая тоже считалась на 32k.
+    const sameModel = !state.model || state.modelRef === ref;
+    if ($('model-ctx').value && sameModel) q.set('ctx', $('model-ctx').value);
     const { model } = await api('/api/model?' + q);
     state.model = model;
+    state.modelRef = ref;
     state.gguf_file = model.gguf_file || '';
     state.offers = [];
     // на своём ПК квант выбирается под это железо, а не под сервер
@@ -1063,6 +1071,13 @@ function renderLocal(s) {
   dockerOpt.textContent = s.docker?.ok ? 'Docker (максимальная изоляция, нужен Docker Desktop)'
     : `Docker (максимальная изоляция) — ${s.docker?.why || 'недоступен'}`;
   if (!s.docker?.ok && $('local-iso').value === 'docker') $('local-iso').value = 'native';
+  // Ограничение прав процесса (Low IL, Job Object) есть только на Windows. На Linux и macOS
+  // обычный режим — это просто процесс с чистым окружением, и обещать там изоляцию нельзя.
+  if (!s.windows) {
+    ISO_NAME.native = 'обычный (без изоляции)';
+    $('local-iso').querySelector('option[value="native"]').textContent =
+      'Обычный (без изоляции: права ограничиваются только на Windows)';
+  }
   $('local-iso-note').innerHTML = $('local-iso').value === 'docker'
     ? 'Сильнее изолирован: даже обход ограничений процесса оставит атакующего внутри виртуальной машины Docker.'
     : 'Ставить ничего не нужно. Скорость полная. Файлы — в <code>' + esc(s.dir) + '</code>.';
@@ -1218,7 +1233,7 @@ $('btn-job-stop').onclick = async () => {
   if (!confirm('Остановить деплой? Заказы, которые он успел арендовать, будут отменены.')) return;
   try {
     await api('/api/deploy/stop', {});
-    toast('останавливаю — отменяю арендованные серверы');
+    toast('останавливаю — деплой сам отменит серверы, которые арендовал (см. лог)');
   } catch (e) { toast(e.message, true); }
 };
 $('btn-orders').onclick = loadOrders;

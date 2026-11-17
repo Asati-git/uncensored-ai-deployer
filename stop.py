@@ -15,7 +15,8 @@ import sys
 import time
 
 from clore import CloreError, order_access
-from deploy import cancel_order_safe, client, load_env, log, save_env_keys, tg, wallet_balances
+from deploy import (cancel_order_safe, cancel_pending, client, load_env, log, save_env_keys, tg,
+                    wallet_balances)
 
 # Отмену повторяем долго и настойчиво: неотменённый заказ тикает до конца срока
 # аренды, а это у Clore до 48 часов.
@@ -36,26 +37,32 @@ def main():
     # Параллельная установка держит номера всех своих заказов в RACE_ORDERS. Если деплой
     # упал посреди гонки, их там может быть десяток, и все оплачиваются — отменяем каждый
     race = [int(x) for x in (env.get("RACE_ORDERS") or "").split(",") if x.strip().isdigit()]
-    if race and not args.order:
+    failed = False       # что-то отменить не удалось — но остальное всё равно отменяем
+    if not args.order and (race or env.get("PENDING_SERVER")):
         clore = client(env)
         left = []
         for r in race:
-            if cancel_order_safe(clore, r, "остановлен вручную", attempts=ATTEMPTS,
-                                 pause=RETRY_PAUSE) is None:
+            if cancel_order_safe(clore, r, None, attempts=ATTEMPTS, pause=RETRY_PAUSE) is None:
                 log(f"заказ гонки {r} отменён")
             else:
                 left.append(r)
                 log(f"⛔ заказ гонки {r} отменить не удалось — он оплачивается")
-        save_env_keys({"RACE_ORDERS": ",".join(str(r) for r in left)})
-        if left:
-            return 1
+        if race:
+            save_env_keys({"RACE_ORDERS": ",".join(str(r) for r in left)})
+        # заказ, который создавался в момент обрыва деплоя: номера нет, есть только сервер
+        pending_ok = cancel_pending(clore, attempts=ATTEMPTS, pause=RETRY_PAUSE)
+        failed = bool(left) or not pending_ok
         if not env.get("ORDER"):
-            return 0
+            return 1 if failed else 0
 
     oid = args.order or env.get("ORDER")
     if not oid:
         log("в .env нет ORDER и не передан --order")
         return 1
+    # Ссылки в .env стираем, только если отменяем именно тот заказ, что там записан:
+    # иначе «stop.py --order 555» стирал номер другого, работающего заказа
+    blank = ({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""}
+             if str(oid) == str(env.get("ORDER") or "") else {})
 
     clore = client(env)
     # Отмена — денежный путь: если она не прошла, сервер тикает до конца срока аренды
@@ -66,7 +73,7 @@ def main():
             order = clore.order(oid)
             if not order:
                 log(f"заказ {oid} не найден среди активных (уже отменён?)")
-                save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
+                save_env_keys(blank)
                 return 1
             spend = order.get("spend")
             clore.cancel_order(oid, args.issue)
@@ -84,12 +91,12 @@ def main():
         # но ссылки на мёртвый сервер надо убрать, иначе UI продолжит их показывать
         if "not_active" in str(getattr(e, "detail", "") or "") or e.code == 4:
             log("заказ уже неактивен — чищу ссылки на него в .env")
-            save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
+            save_env_keys(blank)
         return 1
 
     host = order_access(order).get("host") or "?"
     log(f"заказ {oid} отменён (сервер {order.get('si')}, {host})")
-    save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
+    save_env_keys(blank)
 
     # Заказ уже отменён. Справка о балансе — необязательный шаг: разовый сбой сети на нём
     # не должен выглядеть как неудачная отмена, иначе пользователь полезет отменять снова.
@@ -106,7 +113,7 @@ def main():
                 f"с контейнером).{spent}\nБаланс: ≈${bal_usd:.2f}")
     except CloreError as e:
         log(f"заказ отменён; баланс показать не удалось ({e})")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@
 # Нужен devel-образ CUDA: сервер собирается из исходников с поддержкой GPU.
 # Параметры из env заказа Clore: MODEL_REPO, MODEL_NAME, API_KEY, HF_TOKEN, CTX, GGUF_FILE
 exec > >(tee -a /root/deploy.log >/dev/null) 2>&1
-set -x
 export DEBIAN_FRONTEND=noninteractive
 cd /root
 
@@ -17,6 +16,10 @@ GGUF_FILE="${GGUF_FILE:-__GGUF_FILE__}"
 N_CPU_MOE="${N_CPU_MOE:-__N_CPU_MOE__}"
 PORT="__PORT__"
 MODEL_DIR="/root/models/${MODEL_NAME}"
+
+# Трассировку включаем только здесь: выше присваиваются ключи, и с set -x они
+# попадали бы в /root/deploy.log, а оттуда — в лог деплоя на вашем ПК
+set -x
 
 __COMMON__
 
@@ -32,7 +35,7 @@ if [ ! -f /root/.setup_done ]; then
   stage download
 
   mkdir -p "${MODEL_DIR}"
-  ( export HF_TOKEN="${HF_TOKEN}"; export HF_HUB_ENABLE_HF_TRANSFER=1; export HF_XET_HIGH_PERFORMANCE=1
+  ( set +x; export HF_TOKEN="${HF_TOKEN}"; export HF_HUB_ENABLE_HF_TRANSFER=1; export HF_XET_HIGH_PERFORMANCE=1
     if [ -n "${GGUF_FILE}" ]; then
       # у шардированных GGUF качаем все части: file-00001-of-0000N -> маска по префиксу
       PATTERN=$(echo "${GGUF_FILE}" | sed -E 's/-0*[0-9]+-of-0*[0-9]+\.gguf$/*.gguf/')
@@ -59,7 +62,8 @@ if [ ! -f /root/.setup_done ]; then
   [ -n "${CUDA_ARCH}" ] || CUDA_ARCH="80;86;89;90"
   echo "[setup] собираю llama.cpp под архитектуры: ${CUDA_ARCH}"
 
-  git_clone_retry https://github.com/ggml-org/llama.cpp /root/llama.cpp \n    || { echo "[setup] ОШИБКА: исходники llama.cpp недоступны"; exit 1; }
+  git_clone_retry https://github.com/ggml-org/llama.cpp /root/llama.cpp \
+    || { echo "[setup] ОШИБКА: исходники llama.cpp недоступны"; exit 1; }
   cmake -S /root/llama.cpp -B /root/llama.cpp/build \
     -DGGML_CUDA=ON -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_COMPILER="${CUDACXX}" \
@@ -102,6 +106,7 @@ fi
 
 stage engine
 echo "[setup] запускаю модель из ${GGUF}"
+{ set +x; } 2>/dev/null   # дальше без трассировки: в команде ключ API
 setsid nohup /root/llama.cpp/build/bin/llama-server \
   -m "${GGUF}" \
   --alias "${MODEL_NAME}" \
@@ -113,6 +118,7 @@ setsid nohup /root/llama.cpp/build/bin/llama-server \
   --flash-attn on --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --temp 0.7 --top-p 0.95 --min-p 0.02 > /root/engine.log 2>&1 < /dev/null &
+set -x
 # Эксперты читаются из оперативки только после того, как файл окажется в страничном
 # кэше. Иначе первые минуты они подтягиваются с диска, и скорость вдвое ниже рабочей.
 if [ -n "${N_CPU_MOE}" ] && [ "${N_CPU_MOE}" -gt 0 ] 2>/dev/null; then

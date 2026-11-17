@@ -267,6 +267,14 @@ def detect(env=None):
     vram_total = sum(g["vram_gib"] for g in gpus)
     card_gib = max((g["vram_gib"] for g in gpus), default=0.0)
     used_now = sum(g["used_gib"] or 0 for g in gpus)
+    # Память, занятую нашей же запущенной моделью, «занятой системой» не считаем. Иначе
+    # при работающей модели резерв раздувался до трети карты, и та же самая модель при
+    # перезапуске показывалась как «не влезает» или уходила в медленный режим.
+    try:
+        import localrun
+        used_now = max(0.0, used_now - localrun.own_vram_gib(env))
+    except Exception:  # noqa
+        pass
 
     over_vram = _num(env.get("PC_VRAM_GB"))
     over_ram = _num(env.get("PC_RAM_GB"))
@@ -361,12 +369,11 @@ def _try_modes(w, kv, vocab, moe_off, layers, p):
         fixed = need - w * LOCAL_HEADROOM          # KV и буферы движка, без весов
         share = min((V - fixed) / (w * LOCAL_HEADROOM), 1.0)
         ram = w * (1 - share) * LOCAL_HEADROOM + RAM_RUNTIME_GIB
-        if share >= MIN_GPU_SHARE and ram <= R:
-            out = {"mode": "partial", "vram_gib": round(V, 1), "ram_gib": round(ram, 1),
-                   "gpu_share": round(share, 2)}
-            if layers:
-                out["ngl"] = int(layers * share)
-            return out
+        # Без числа слоёв делить модель между картой и оперативкой нечем: llama-server
+        # получил бы -ngl 999 и грузил в карту всё — то есть ровно то, что в неё не влезает
+        if share >= MIN_GPU_SHARE and ram <= R and layers:
+            return {"mode": "partial", "vram_gib": round(V, 1), "ram_gib": round(ram, 1),
+                    "gpu_share": round(share, 2), "ngl": int(layers * share)}
 
     ram = (w + kv) * LOCAL_HEADROOM + RAM_RUNTIME_GIB
     if not p["unified"] and ram <= R:

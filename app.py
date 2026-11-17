@@ -76,6 +76,7 @@ def run_deploy(cfg):
             raise RuntimeError("деплой уже идёт")
         JOB.update(running=True, log=[], result=None, error=None,
                    started=time.time(), title=cfg.get("model"))
+        JOB["race"] = bool(cfg.get("race"))
     JOB_STOP.clear()
     cfg = {**cfg, "stop": JOB_STOP.is_set}
 
@@ -85,11 +86,11 @@ def run_deploy(cfg):
             with JOB_LOCK:
                 JOB["result"] = res
             job_log("задача завершена: " + str(res.get("status")))
-        except deploy.DeployStopped as e:
+        except deploy.DeployStopped:
             # не ошибка: заказ отменил сам пользователь, и деплой послушно встал
             with JOB_LOCK:
                 JOB["result"] = {"status": "stopped"}
-            job_log(f"⏹ {e}. Очередь серверов дальше не идёт")
+            job_log("⏹ деплой остановлен. Очередь серверов дальше не идёт")
         except BaseException as e:  # noqa
             with JOB_LOCK:
                 JOB["error"] = str(e) or e.__class__.__name__
@@ -216,6 +217,8 @@ def env_state():
             # заказы прерванной гонки: остаются, только если деплой упал посреди неё
             "race_orders": [] if JOB["running"] else
             [x for x in (env.get("RACE_ORDERS") or "").split(",") if x.strip()],
+            # деплой оборвался между запросом на аренду и получением номера заказа
+            "pending_server": "" if JOB["running"] else (env.get("PENDING_SERVER") or ""),
         },
         "defaults": {"ctx": deploy.DEFAULT_CTX, "images": deploy.IMAGES,
                      "api_port": deploy.API_PORT},
@@ -517,18 +520,9 @@ def api_post(path, body):
             raise ValueError("деплой не идёт")
         JOB_STOP.set()
         job_log("⏹ остановка по кнопке")
-        # Гонка свои заказы отменяет сама (RACE_ORDERS). А в очереди текущий заказ надо
-        # отменить отсюда: иначе остановленный деплой оставил бы его оплачиваться
-        cur = deploy.load_env()
-        oid = cur.get("ORDER")
-        if oid and not cur.get("RACE_ORDERS"):
-            err = deploy.cancel_order_safe(Clore(env.get("CLORE_API_KEY")), int(oid),
-                                           "остановлен вручную", logf=job_log, attempts=3, pause=3)
-            if err is not None:
-                raise RuntimeError(f"деплой остановлен, но заказ {oid} отменить не удалось — "
-                                   f"он оплачивается: {err}")
-            deploy.save_env_keys({"ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
-            job_log(f"заказ {oid} отменён")
+        # Заказы отменяет сам поток деплоя — те, что он арендовал. Отсюда их трогать
+        # нельзя: по номеру из .env можно было отменить чужой работающий сервер, а заказ,
+        # который создаётся в эту секунду, в .env ещё не записан.
         return {"ok": True}
 
     if path == "/api/cancel":
@@ -701,6 +695,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"{e.__class__.__name__}: {e}"})
 
 
+def _stop_job_on_exit():
+    """
+    UI закрывают посреди деплоя. Поток деплоя — фоновый и умрёт вместе с процессом, не
+    отменив ничего. В гонке это десяток оплачиваемых серверов, поэтому её останавливаем
+    и ждём отмены заказов. Обычный деплой не трогаем: сервер доустановится сам, но о том,
+    что он оплачивается, говорим.
+    """
+    with JOB_LOCK:
+        running, race = JOB["running"], JOB.get("race")
+    if not running:
+        return
+    if not race:
+        print("⚠️ деплой шёл и прерван: арендованный сервер продолжает оплачиваться. "
+              "Отменить заказ: python stop.py", flush=True)
+        return
+    print("идёт параллельная установка — отменяю её заказы, не закрывайте окно…", flush=True)
+    JOB_STOP.set()
+    t0 = time.time()
+    try:
+        while time.time() - t0 < 300:
+            with JOB_LOCK:
+                if not JOB["running"]:
+                    print("заказы гонки отменены", flush=True)
+                    return
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    print("⛔ не дождался отмены заказов гонки — запустите python stop.py", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
@@ -728,6 +752,7 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nостановлено")
+        _stop_job_on_exit()
     finally:
         srv.server_close()
 
