@@ -269,8 +269,13 @@ class H(http.server.BaseHTTPRequestHandler):
             c = cpu()
         except Exception:
             c = 0
+        # Что за модель здесь стоит: по этому UI переключается на заказ кнопкой
+        # «Использовать». Берётся из env заказа; ключи (API_KEY, HF_TOKEN) не отдаём
         body = json.dumps({"stage": st, "bytes": n, "beat": beat, "gpu": gpu,
-                           "cpu": c, "fail": fail}).encode()
+                           "cpu": c, "fail": fail,
+                           "repo": os.environ.get("MODEL_REPO", ""),
+                           "ctx": os.environ.get("CTX", ""),
+                           "format": os.environ.get("WEIGHT_FORMAT", "")}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

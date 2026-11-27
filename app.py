@@ -21,7 +21,7 @@ import deploy
 import hfmodels
 import localpc
 import localrun
-from clore import PRICE_PERIOD_HOURS, Clore, CloreError, order_access, server_brief
+from clore import MARKET_TTL, PRICE_PERIOD_HOURS, Clore, CloreError, blocked_for, order_access, server_brief
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -204,6 +204,9 @@ def env_state():
     alive = bool(api_url and env.get("API_KEY") and deploy.api_alive(api_url, env["API_KEY"], timeout=4))
     return {
         "settings": settings,
+        # сколько секунд ещё не стучимся в Clore после блокировки (0 — всё в порядке).
+        # Считается локально, без запроса в сеть
+        "clore_blocked": blocked_for(env.get("CLORE_API_KEY")),
         "current": {
             "order": env.get("ORDER") or "",
             "server": env.get("SERVER") or "",
@@ -225,7 +228,44 @@ def env_state():
     }
 
 
+def _num(v, name="значение"):
+    """Число из поля формы. Запятую принимаем: «0,5» человек пишет чаще, чем «0.5»."""
+    if v is None or str(v).strip() in ("", "null"):
+        return None
+    try:
+        return float(str(v).strip().replace(",", "."))
+    except ValueError:
+        raise ValueError(f"«{v}» — не число ({name})") from None
+
+
+# Когда UI последний раз что-то спрашивал: пока страница открыта, она опрашивает /api/job
+UI_SEEN = {"t": time.time()}
+
+
+def _market_warmer():
+    """
+    Держит список серверов Clore скачанным заранее. Маркетплейс весит мегабайты и
+    качается 15–20 с — раньше это ожидание приходилось на «Найти серверы». Теперь список
+    качается при запуске и обновляется раз в ~1.5 мин, пока UI открыт. Это один запрос в
+    полторы минуты — в десятки раз реже лимита Clore (1 запрос/с). Не трогаем Clore, пока
+    он на паузе после сбоя связи, идёт деплой (его запросы важнее) или UI закрыт.
+    """
+    while True:
+        try:
+            key = (deploy.load_env().get("CLORE_API_KEY") or "").strip()
+            idle = time.time() - UI_SEEN["t"] > 180
+            if key and not idle and not JOB["running"] and not blocked_for(key):
+                clore = Clore(key)
+                age = clore.market_age()
+                if age is None or age > MARKET_TTL - 30:
+                    clore.marketplace(fresh="if-old")
+        except Exception:   # noqa — подогрев необязателен: не вышло, значит скачаем по кнопке
+            pass
+        time.sleep(5)
+
+
 def api_get(path, q):
+    UI_SEEN["t"] = time.time()
     env = deploy.load_env()
     token = env.get("HF_TOKEN") or None
 
@@ -322,11 +362,12 @@ def api_get(path, q):
 
     if path == "/api/offers":
         clore = Clore(env.get("CLORE_API_KEY"))
-        num = lambda k, d=None: (float(q[k][0]) if q.get(k) and q[k][0] not in ("", "null") else d)  # noqa: E731
+        num = lambda k, d=None: (_num(q[k][0], k) if q.get(k) and q[k][0] not in ("", "null") else d)  # noqa: E731
         # Оплата идёт по часам (проверено на живом заказе), поэтому баланс ограничивает
         # не цену сервера, а время его работы. Отдаём баланс как есть, чтобы в карточке
         # было видно, на сколько часов хватит денег.
-        rates = clore.currency_rates()
+        servers = clore.marketplace()
+        rates = clore.currency_rates(servers)
         bal_usd = sum(a * rates.get(c, 0) for c, a in deploy.wallet_balances(clore).items())
         hidden = {}   # сколько серверов отсеял каждый фильтр — показываем под списком
         cpu_moe = (q.get("cpu_moe") or [""])[0] == "1"
@@ -338,6 +379,7 @@ def api_get(path, q):
                 "cpu_moe": cpu_moe,
                 "offers": deploy.find_offers(
             clore,
+            servers=servers,
             need_vram=num("vram", 0),
             need_disk=num("disk", 0),
             max_price_usd=num("max_price"),
@@ -362,7 +404,8 @@ def api_get(path, q):
 
     if path == "/api/job":
         with JOB_LOCK:
-            return {"running": JOB["running"], "log": list(JOB["log"]), "result": JOB["result"],
+            return {"running": JOB["running"], "stopping": JOB["running"] and JOB_STOP.is_set(),
+                    "log": list(JOB["log"]), "result": JOB["result"],
                     "error": JOB["error"], "title": JOB["title"],
                     "elapsed": int(time.time() - JOB["started"]) if JOB["started"] else 0}
 
@@ -392,6 +435,10 @@ def api_post(path, body):
         return {"ok": True, "stopped": localrun.stop_running(env, logf=ljob_log)}
 
     if path == "/api/local/delete":
+        with LJOB_LOCK:
+            if LJOB["running"]:
+                raise ValueError("идёт установка — удалять модели можно после неё "
+                                 "(или остановите её кнопкой «Остановить»)")
         localrun.delete_model(env, str((body or {}).get("repo") or ""))
         return {"ok": True}
 
@@ -488,7 +535,13 @@ def api_post(path, body):
         cfg = {
             "model": (body.get("model") or "").strip(),
             "ctx": int(body["ctx"]) if body.get("ctx") else None,
-            "max_price_usd": float(body["max_price"]) if body.get("max_price") else None,
+            "max_price_usd": _num(body.get("max_price"), "цена"),
+            # фильтры вкладки «Сервер» — автоподбор деплоя должен искать по ним же
+            "min_vram": _num(body.get("min_vram"), "VRAM"),
+            "min_disk": _num(body.get("min_disk"), "диск"),
+            "min_net": _num(body.get("min_net"), "сеть"),
+            "min_ram": _num(body.get("min_ram"), "RAM"),
+            "allow_old_gpu": bool(body.get("old_gpu")),
             "currency": body.get("currency") or "auto",   # валюта списания; USD — только отображение
             "order_type": body.get("order_type") or "on-demand",
             # очередь серверов из UI: не поднялся первый — деплой идёт ко второму.
@@ -511,6 +564,15 @@ def api_post(path, body):
             raise ValueError("не задан API-ключ Clore.ai (вкладка «Настройки»)")
         if not env.get("API_KEY"):
             raise ValueError("не задан ключ вашего API (вкладка «Настройки»)")
+        with JOB_LOCK:
+            if JOB["running"]:
+                raise ValueError("деплой уже идёт — дождитесь его или нажмите «Остановить деплой»")
+        # Раньше «деплой запущен» показывался и тогда, когда модель уже работала: задача
+        # тихо завершалась статусом already-running, и было непонятно, что произошло
+        if (not cfg["force"] and not cfg["dry_run"] and env.get("ORDER") and env.get("API_URL")
+                and deploy.api_alive(env["API_URL"], env.get("API_KEY") or "", timeout=5)):
+            raise ValueError(f"заказ {env['ORDER']} уже работает ({env['API_URL']}). Нужен ещё "
+                             f"один сервер — поставьте галочку «арендовать ещё один сервер»")
         run_deploy(cfg)
         return {"ok": True}
 
@@ -566,6 +628,9 @@ def api_post(path, body):
 
     if path == "/api/use":
         """Переключить .env и OpenCode на уже существующий заказ Clore."""
+        with JOB_LOCK:
+            if JOB["running"]:
+                raise ValueError("идёт деплой — переключаться на другой заказ можно после него")
         oid = int(body["order"])
         clore = Clore(env.get("CLORE_API_KEY"))
         order = clore.order(oid)
@@ -576,10 +641,25 @@ def api_post(path, body):
             raise ValueError("у заказа ещё нет проброшенного порта API")
         url = f"http://{acc['host']}:{acc['ports'][deploy.API_PORT]}/v1"
         ssh = f"ssh -p {acc['ports'].get(22, 22)} root@{acc['host']}"
+        key = env.get("API_KEY") or ""
+        # Модель, контекст и движок — с самого сервера: иначе карточка, OpenCode и Claude
+        # остались бы с моделью прошлого деплоя
+        same = str(oid) == str(env.get("ORDER") or "")
+        m = deploy.order_model(acc["host"], acc["ports"], url, key)
+        repo = m["repo"] or (env.get("MODEL_REPO") if same else "") or ""
+        ctx = m["ctx"] or (int(env.get("CTX") or 0) if same else 0) or deploy.DEFAULT_CTX
+        engine = m["engine"] or (env.get("ENGINE") if same else "") or ""
         deploy.save_env_keys({"ORDER": str(oid), "SERVER": str(order.get("si")),
-                              "API_URL": url, "SSH": ssh})
-        deploy.update_opencode(url, env.get("API_KEY") or "")
-        return {"ok": True, "api_url": url, "ssh": ssh}
+                              "API_URL": url, "SSH": ssh, "MODEL_REPO": repo,
+                              "CTX": str(ctx), "ENGINE": engine})
+        deploy.update_opencode(url, key, repo.split("/")[-1] or None, logf=job_log,
+                               ctx=ctx, engine=engine or None)
+        warn = None
+        if not m["repo"] and not same:
+            warn = ("сервер не сообщил, какая на нём модель (заказ старой версии) — "
+                    f"контекст {'взят у движка' if m['ctx'] else 'по умолчанию'}: {ctx}")
+        return {"ok": True, "api_url": url, "ssh": ssh, "model": repo, "ctx": ctx,
+                "engine": engine, "warning": warn}
 
     raise FileNotFoundError(path)
 
@@ -746,6 +826,7 @@ def main():
 
     url = f"http://{args.host}:{args.port}/"
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    threading.Thread(target=_market_warmer, daemon=True).start()
     print(f"UncensoredAI UI: {url}  (Ctrl+C чтобы остановить)", flush=True)
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()

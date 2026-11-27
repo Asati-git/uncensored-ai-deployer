@@ -46,9 +46,20 @@ const PERIOD_NOTE = {
 };
 
 // ───────── сеть ─────────
-async function api(path, body) {
+async function api(path, body, timeoutMs) {
   const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};
-  const res = await fetch(path, opts);
+  let res;
+  if (timeoutMs) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try { res = await fetch(path, { ...opts, signal: ctl.signal }); }
+    catch (e) {
+      if (e.name === 'AbortError') throw new Error(`нет ответа за ${Math.round(timeoutMs / 1000)} с`);
+      throw e;
+    } finally { clearTimeout(timer); }
+  } else {
+    res = await fetch(path, opts);
+  }
   const data = await res.json().catch(() => ({ error: 'плохой ответ сервера' }));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
@@ -63,11 +74,39 @@ function toast(msg, bad) {
   toastTimer = setTimeout(() => (t.className = ''), 4200);
 }
 
+// Счётчик, а не флаг: одно и то же действие запускается разными путями (кнопка, Enter,
+// смена фильтра). Раньше второй вызов запоминал как «исходную» надпись уже «ищу…», и
+// кнопка навсегда оставалась с ней, а первый закончившийся запрос разблокировал кнопку,
+// пока второй ещё шёл.
 const busy = (btn, on, label) => {
-  btn.disabled = on;
-  if (on) { btn.dataset.text = btn.textContent; btn.textContent = label || '…'; }
-  else if (btn.dataset.text) btn.textContent = btn.dataset.text;
+  if (!btn) return;
+  const n = Math.max(0, Number(btn.dataset.busy || 0) + (on ? 1 : -1));
+  btn.dataset.busy = String(n);
+  // исходный русский текст, а не переведённый на экране: его и вернём, а перевод наложится сам
+  if (on && n === 1) btn.dataset.text = window.i18nSource ? i18nSource(btn) : btn.textContent;
+  if (n > 0) {
+    btn.disabled = true;
+    if (label) btn.textContent = label;
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.text !== undefined) { btn.textContent = btn.dataset.text; delete btn.dataset.text; }
+  }
 };
+
+// Номер последнего запроса каждого вида. Ответы приходят в любом порядке, и без этого
+// побеждал последний ПРИШЕДШИЙ, а не последний запрошенный: щёлкнул модель A, потом B —
+// в карточке оставалась A.
+const reqSeq = {};
+const nextReq = (kind) => (reqSeq[kind] = (reqSeq[kind] || 0) + 1);
+const isLatest = (kind, n) => reqSeq[kind] === n;
+
+// Цена: человек пишет «0,5» — принимаем и запятую. null — пусто, NaN — не число
+function priceValue() {
+  const v = $('f-price').value.trim().replace(',', '.');
+  if (!v) return null;
+  const n = Number(v);
+  return n > 0 ? v : NaN;
+}
 
 // ───────── форматирование ─────────
 const fmtUsd = (v) => v == null ? '—' : `$${Number(v).toFixed(Number(v) < 1 ? 3 : 2)}/ч`;
@@ -81,7 +120,13 @@ const fmtCoin = (v, cur) => v == null ? '' :
   `${Number(v).toFixed(cur === 'bitcoin' ? 8 : 2)} ${COIN[cur] || cur}`;
 const fmtNum = (n) => n == null ? '—' : Number(n).toLocaleString('ru-RU');
 const fmtK = (n) => !n ? '0' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
-const fmtCtx = (c) => !c ? '—' : c >= 1024 ? Math.round(c / 1024) + 'k' : String(c);
+// в обычных тысячах, как пишут в карточках моделей: 262144 — «262k», а не «256k»
+const fmtCtx = (c) => !c ? '—' : c >= 1e6 ? +(c / 1e6).toFixed(1) + 'M'
+  : c >= 1000 ? Math.round(c / 1000) + 'k' : String(c);
+// Бейдж нативного контекста модели. Агенту (OpenCode) мало 128k — сессия постоянно
+// сжимается, поэтому длинный контекст выделяем цветом
+const ctxBadge = (c) => !c ? '' : `<span class="badge ctx${c >= 500000 ? ' long' : c < 131072 ? ' short' : ''}"
+  title="Нативный контекст модели — сколько токенов она держит в одной сессии">контекст ${fmtCtx(c)}</span>`;
 
 // ───────── вкладки ─────────
 document.querySelectorAll('.tab').forEach((tab) => {
@@ -89,8 +134,65 @@ document.querySelectorAll('.tab').forEach((tab) => {
     document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t === tab));
     document.querySelectorAll('.page').forEach((p) => p.classList.toggle('active', p.id === 'page-' + tab.dataset.tab));
     if (tab.dataset.tab === 'orders') { loadOrders(); loadWallets(); }
+    if (tab.dataset.tab === 'server') autoOffers();
+    if (STEPS.clore.includes(tab.dataset.tab) || STEPS.pc.includes(tab.dataset.tab)) state.lastStep = tab.dataset.tab;
+    updateStepNav();
+    window.scrollTo({ top: 0 });
   };
 });
+
+// ───────── навигация по этапам ─────────
+// Кнопки «назад / далее» справа снизу: до вкладок наверху на длинной странице тянуться
+// далеко. Этапы зависят от режима: аренда на Clore или запуск на этом ПК.
+const STEPS = { clore: ['model', 'server', 'deploy'], pc: ['model', 'pc'] };
+
+const tabEl = (id) => document.querySelector(`.tab[data-tab="${id}"]`);
+const tabName = (id) => ((window.i18nSource ? i18nSource(tabEl(id)) : tabEl(id)?.textContent) || id).replace(/^\s*\d+\s*·\s*/, '').trim();
+const goStep = (id) => tabEl(id)?.click();
+
+// Выполнен ли этап — тогда «далее» подсвечивается
+function stepDone(id) {
+  if (id === 'model') return Boolean(state.model);
+  if (id === 'server') return Boolean(state.offers.length || state.offersData?.offers?.length);
+  return false;
+}
+
+function updateStepNav() {
+  const prev = $('step-prev'), next = $('step-next');
+  if (!prev || !next) return;
+  const steps = STEPS[state.where] || STEPS.clore;
+  const cur = document.querySelector('.tab.active')?.dataset.tab;
+  const i = steps.indexOf(cur);
+  if (i < 0) {
+    // «Заказы» и «Настройки» — не этапы: предлагаем вернуться туда, где остановились
+    const back = steps.includes(state.lastStep) ? state.lastStep : steps[0];
+    prev.classList.add('hidden');
+    next.classList.remove('hidden', 'ready');
+    next.textContent = `↩ Вернуться: ${tabName(back)}`;
+    next.onclick = () => goStep(back);
+    return;
+  }
+  prev.classList.toggle('hidden', i === 0);
+  if (i > 0) {
+    prev.textContent = `← ${tabName(steps[i - 1])}`;
+    prev.onclick = () => goStep(steps[i - 1]);
+  }
+  if (i === steps.length - 1) {
+    // последний этап: дальше идти некуда, но к заказам перейти полезно
+    next.classList.remove('hidden', 'ready');
+    next.textContent = `${tabName('orders')} →`;
+    next.onclick = () => goStep('orders');
+    return;
+  }
+  const to = steps[i + 1];
+  next.classList.remove('hidden');
+  next.textContent = `Далее: ${tabName(to)} →`;
+  next.onclick = () => goStep(to);
+  const ready = stepDone(cur);
+  // подсветка включается один раз при переходе «не готово → готово», а не мигает постоянно
+  if (ready && !next.classList.contains('ready')) next.classList.add('ready');
+  if (!ready) next.classList.remove('ready');
+}
 
 // ───────── состояние ─────────
 async function loadState() {
@@ -100,9 +202,17 @@ async function loadState() {
   if (!$('model-ctx').placeholder.includes('по умолчанию')) $('model-ctx').placeholder = `контекст (${s.defaults.ctx})`;
 
   const cur = s.current;
+  // заметка о пути OpenCode относится к конкретному заказу — сменился заказ, убираем её
+  if (state.noteOrder !== cur.order) { state.noteOrder = cur.order; state.opencodeNote = ''; }
   const pill = $('status-pill');
   if (!s.settings.CLORE_API_KEY.set) { pill.className = 'pill warn'; pill.textContent = 'нет ключа Clore'; }
-  else if (cur.alive) { pill.className = 'pill ok'; pill.textContent = `модель онлайн · заказ ${cur.order}`; }
+  else if (s.clore_blocked > 0) {
+    // Cloudflare перед Clore временно не пускает этот IP. Кнопки, которые ходят в Clore,
+    // ответят ошибкой сразу; повторные нажатия только продлевают блокировку
+    pill.className = 'pill warn';
+    pill.textContent = `Clore недоступен — пауза ${s.clore_blocked} с`;
+    pill.title = 'Похоже на временную блокировку IP за частые запросы. Подождите и не нажимайте кнопки повторно';
+  } else if (cur.alive) { pill.className = 'pill ok'; pill.textContent = `модель онлайн · заказ ${cur.order}`; }
   else if (cur.order) { pill.className = 'pill warn'; pill.textContent = `заказ ${cur.order} · API молчит`; }
   else { pill.className = 'pill'; pill.textContent = 'сервер не арендован'; }
 
@@ -114,7 +224,14 @@ async function loadState() {
     // Обычное поле показывает ровно то, что лежит в .env, включая пустоту. Раньше
     // пустое значение поле не трогало, и после очистки оно могло показывать старое —
     // то есть расходиться с тем, что реально применяется при деплое.
-    if (input.type !== 'password') input.value = v.value || '';
+    // Секрет определяем по флагу сервера, а не по типу поля: «сгенерировать» делает поле
+    // ключа текстовым, и раньше первый же loadState стирал сгенерированный ключ.
+    // Поле, которое человек правит прямо сейчас (значение отличается от загруженного
+    // в прошлый раз), тоже не трогаем — иначе опрос затирал недописанное.
+    if (v.secret || input.type === 'password') continue;
+    const dirty = input.dataset.loaded !== undefined && input.value !== input.dataset.loaded;
+    if (!dirty) input.value = v.value || '';
+    input.dataset.loaded = v.value || '';
   }
 
   renderCurrent();
@@ -134,7 +251,12 @@ function renderCurrent() {
     + (c.pending_server
       ? `<p class="warn-text">⚠ Деплой оборвался в момент аренды сервера ${esc(c.pending_server)}: заказ мог
          создаться и оплачиваться. Проверьте вкладку «Заказы» (или <code>python stop.py</code>).</p>` : '');
-  if (!c.order) { box.innerHTML = raceNote + '<p class="muted">Активного заказа нет.</p>'; return; }
+  if (!c.order) {
+    box.innerHTML = raceNote + (state.jobRunning
+      ? '<p class="muted">Идёт деплой — сервер появится здесь, как только будет арендован.</p>'
+      : '<p class="muted">Активного заказа нет.</p>');
+    return;
+  }
   box.innerHTML = raceNote + `<div class="grid">
     <div class="kv"><b>${esc(c.order)}</b><span>заказ Clore</span></div>
     <div class="kv"><b>${esc(c.server || '—')}</b><span>сервер</span></div>
@@ -146,7 +268,7 @@ function renderCurrent() {
     Модель: <code>${esc(c.model_repo || '—')}</code> · id в API: <code>${esc(c.model_name)}</code><br>
     Base URL: <code class="copy" data-copy="${esc(c.api_url)}">${esc(c.api_url || '—')}</code><br>
     SSH: <code class="copy" data-copy="${esc(c.ssh)}">${esc(c.ssh || '—')}</code>
-  </div>`;
+  </div>${state.opencodeNote || ''}`;
   box.querySelectorAll('.copy').forEach((n) => (n.onclick = () => {
     navigator.clipboard.writeText(n.dataset.copy || ''); toast('скопировано');
   }));
@@ -187,6 +309,7 @@ function topModel(m) {
   const box = el('div', 'tmodel');
   box.innerHTML = `<div class="name">${esc(m.title)}
       <span class="badge tier">${esc(m.tier)}</span>
+      ${ctxBadge(m.ctx_max)}
       ${m.gated ? '<span class="badge gated">gated</span>' : ''}</div>
     <div class="meta">${m.base ? esc(m.base) + ' · ' : ''}${metricLine(m, 'top')}</div>
     <div class="why">${esc(m.why)}</div>
@@ -236,6 +359,7 @@ function topItem(f) {
     const d = el('details', 'tfold');
     d.innerHTML = `<summary><b>${esc(m.title)}</b>
       <span class="badge tier">${esc(m.tier)}</span>
+      ${ctxBadge(m.ctx_max)}
       <span class="muted">${esc(m.base)}</span></summary>`;
     d.appendChild(topModel(m));
     box.appendChild(d);
@@ -255,6 +379,7 @@ async function searchModels() {
   const top = Boolean(TOP_KINDS[state.period]);
   box.innerHTML = '<p class="muted">ищу на Hugging Face…</p>';
   busy($('btn-search'), true, 'ищу…');
+  const my = nextReq('search');
   // в режиме топа свой поисковый запрос не участвует — подборка фиксированная
   $('q').disabled = top;
   try {
@@ -262,6 +387,7 @@ async function searchModels() {
       ? new URLSearchParams({ fmt: $('fmt').value, kind: TOP_KINDS[state.period] })
       : new URLSearchParams({ q: $('q').value.trim(), period: state.period, fmt: $('fmt').value, limit: '40' });
     const data = await api((top ? '/api/top?' : '/api/models?') + q);
+    if (!isLatest('search', my)) return;      // уже запросили другой список
     const models = top ? data.families : data.models;
     $('period-note').innerHTML = (PERIOD_NOTE[state.period] || '') +
       (data.relaxed ? ' <b>За такой срок обновлений не нашлось — показан тренд без ограничения по свежести.</b>' : '');
@@ -276,7 +402,7 @@ async function searchModels() {
       box.appendChild(top ? topItem(m) : modelItem(m));
     });
     annotateFits(box);
-  } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
+  } catch (e) { if (isLatest('search', my)) box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
   finally { busy($('btn-search'), false); }
 }
 
@@ -287,6 +413,7 @@ async function pickModel() {
   card.classList.remove('hidden');
   card.innerHTML = '<p class="muted">читаю репозиторий…</p>';
   busy($('btn-pick'), true, '…');
+  const my = nextReq('pick');
   try {
     const q = new URLSearchParams({ ref });
     // Поле «контекст» после выбора модели хранит ЕЁ контекст. Отправлять его можно только
@@ -295,27 +422,37 @@ async function pickModel() {
     const sameModel = !state.model || state.modelRef === ref;
     if ($('model-ctx').value && sameModel) q.set('ctx', $('model-ctx').value);
     const { model } = await api('/api/model?' + q);
+    if (!isLatest('pick', my)) return;        // пока читали, выбрали другую модель
+    // Та же модель перечитывается при смене контекста или режима «Сервер / Мой ПК». Раньше
+    // это молча стирало очередь серверов и выбранный квант — и аренда уходила не туда
+    const same = Boolean(state.model) && state.modelRef === ref;
+    const opts = model.gguf_options || [];
+    const keptQuant = same && opts.some((x) => x.path === state.gguf_file) ? state.gguf_file : '';
     state.model = model;
     state.modelRef = ref;
-    state.gguf_file = model.gguf_file || '';
-    state.offers = [];
-    // на своём ПК квант выбирается под это железо, а не под сервер
+    state.gguf_file = keptQuant || model.gguf_file || '';
+    if (!same) { state.offers = []; state.offersData = null; state.offersSig = null; }
+    // на своём ПК квант выбирается под это железо, а не под сервер — если выбранный не влезает
     const best = model.local?.best;
-    if (state.where === 'pc' && best?.path) state.gguf_file = best.path;
-    renderModelCard(model);
     if (state.where === 'pc' && best?.path) {
-      const o = (model.gguf_options || []).find((x) => x.path === best.path);
-      if (o) applyQuant(o);
+      const row = (model.local.options || []).find((r) => r.path === state.gguf_file);
+      if (!keptQuant || !row?.mode) state.gguf_file = best.path;
     }
+    renderModelCard(model);
     applyNeed();
     $('f-disk').value = model.disk_gb;
     $('model-ctx').value = model.ctx;
+    const o = opts.find((x) => x.path === state.gguf_file);
+    if (o && state.gguf_file !== model.gguf_file) applyQuant(o);
     renderPlan();
-    $('offers').innerHTML = '';
-    toast(`${model.repo_id}: ${model.format} → ${model.engine}`);
+    if (same && state.offersData) renderOffers(); else $('offers').innerHTML = '';
+    autoOffers();
+    if (!same) toast(`${model.repo_id}: ${model.format} → ${model.engine}`);
   } catch (e) {
+    if (!isLatest('pick', my)) return;
     card.innerHTML = `<p class="muted">не получилось: ${esc(e.message)}</p>`;
     state.model = null;
+    renderPlan();
   } finally { busy($('btn-pick'), false); }
 }
 
@@ -357,7 +494,7 @@ function applyQuant(o) {
   // селекты в карточке и в списке должны показывать одно и то же
   document.querySelectorAll('.quant select').forEach((s) => { s.value = o.path; });
   document.querySelectorAll('.qsummary').forEach((n) => (n.textContent = quantSummary(state.model)));
-  renderPlan();
+  refreshOffersView();
 }
 
 const quantSummary = (m) =>
@@ -394,7 +531,7 @@ function renderModelCard(m) {
       у llama.cpp кэш в q8_0, у vLLM в fp16. При подборе сервера к этой цифре добавляется 10% запаса.</p>
     ${m.ctx_max && m.ctx_max > m.ctx ? `<p class="muted" style="margin:6px 0 0">Модель держит
       ${fmtCtx(m.ctx_max)} контекста, по умолчанию берём ${fmtCtx(m.ctx)}: на полном KV-кэш
-      требует больше VRAM, чем сама модель. Поднять — поле «контекст» выше, пересчитается сразу.</p>` : ''}
+      занял бы ${m.ctx ? Math.round(m.kv_gib * m.ctx_max / m.ctx) : '?'} GiB VRAM. Поднять — поле «контекст» выше, пересчитается сразу.</p>` : ''}
     ${m.cpu_moe ? `<p class="muted only-clore" style="margin:6px 0 0">Это MoE: ${m.moe.experts} экспертов,
       на токен работают ${m.moe.active}. Поэтому их можно держать в обычной оперативке и считать
       на CPU: карта нужна в разы скромнее. Но и скорость падает в разы — на одной и той же
@@ -430,6 +567,23 @@ function vllmSplit(gpuCount) {
 function offerMatches(query, o) {
   const hay = `${o.gpu_count}x ${o.gpu || ''} id ${o.id}`.toLowerCase();
   return query.toLowerCase().split(/[\s,]+/).filter(Boolean).every((t) => hay.includes(t));
+}
+
+// Всё, от чего зависит список серверов. Запоминаем при поиске и сравниваем потом: сменили
+// квант, тип заказа или фильтр — список и цены в нём уже не про то, что будет арендовано.
+function offersSig() {
+  return JSON.stringify([state.model?.repo_id, state.gguf_file, $('order-type').value, $('f-vram').value,
+    $('f-disk').value, $('f-net').value, $('f-ram').value, $('f-price').value.trim(),
+    Boolean($('f-old-gpu')?.checked), cpuMoeOn()]);
+}
+
+// Сколько VRAM нужно модели с текущим квантом и режимом
+const needVram = () => (state.model ? (cpuMoeOn() ? state.model.vram_cpu_moe_gib : state.model.vram_gib) : 0);
+const vramShort = (o) => Boolean(state.model) && Number(o.vram_gb) < needVram();
+
+function refreshOffersView() {
+  if (state.offersData) renderOffers();
+  renderPlan();
 }
 
 // Рисует список из того, что уже скачано. Фильтр по имени применяется здесь, а не
@@ -483,7 +637,18 @@ function renderOffers() {
          Ничего не выбрано — сервер подберётся автоматически.</p>`
       : '';
 
-  box.innerHTML = limitNote + hiddenNote + banNote + ramNote + queueNote + foundNote;
+  const stale = state.offersSig && state.offersSig !== offersSig();
+  const staleNote = stale
+    ? `<p class="warn-text">⚠ После поиска изменились квант, тип заказа или фильтры — список и цены
+       устарели. <a href="#" id="offers-refresh">Обновить список</a></p>` : '';
+  const shortQ = state.offers.filter(vramShort);
+  const shortNote = shortQ.length
+    ? `<p class="warn-text">⚠ В очереди ${shortQ.map((o) => o.id).join(', ')}: VRAM меньше нужных
+       ≈${needVram()} ГиБ для выбранного кванта — модель там, скорее всего, не поднимется.
+       Уберите ${shortQ.length === 1 ? 'его' : 'их'} или выберите квант меньше.</p>` : '';
+  box.innerHTML = staleNote + shortNote + limitNote + hiddenNote + banNote + ramNote + queueNote + foundNote;
+  const refresh = $('offers-refresh');
+  if (refresh) refresh.onclick = (e) => { e.preventDefault(); loadOffers(); };
   const queueClear = $('queue-clear');
   if (queueClear) {
     queueClear.onclick = (e) => {
@@ -497,9 +662,11 @@ function renderOffers() {
   if (clearLink) {
     clearLink.onclick = async (e) => {
       e.preventDefault();
-      await api('/api/blacklist', { clear: true });
-      toast('чёрный список очищен');
-      loadOffers();
+      try {
+        await api('/api/blacklist', { clear: true });
+        toast('чёрный список очищен');
+        loadOffers();
+      } catch (err) { toast(err.message, true); }
     };
   }
   if (!shown.length) {
@@ -537,6 +704,7 @@ function renderOffers() {
       <div class="side">
         ${i === 0 ? '<span class="badge">лучшая цена</span>' : ''}
         ${place >= 0 ? `<span class="badge tier">${place + 1}-й в очереди</span>` : ''}
+        ${vramShort(o) ? `<span class="badge gated" title="нужно ≈${needVram()} ГиБ для выбранного кванта">мало VRAM</span>` : ''}
         ${split}
         <b>${fmtUsd(o.price_used)}</b>
         <button>${place >= 0 ? 'Убрать' : 'В очередь'}</button>
@@ -581,13 +749,26 @@ function applyNeed() {
   }
   $('f-vram').value = Math.ceil(cpuMoeOn() ? m.vram_cpu_moe_gib : m.vram_gib);
   $('f-ram').value = cpuMoeOn() ? m.ram_gb : '';
-  renderPlan();
+  refreshOffersView();
 }
+
+const OFFERS_TIMEOUT_MS = 180000;
 
 async function loadOffers() {
   const box = $('offers');
-  box.innerHTML = '<p class="muted">запрашиваю маркетплейс Clore…</p>';
+  const price = priceValue();
+  if (Number.isNaN(price)) return toast('«Цена ≤ $/ч» — число, например 0.5', true);
+  const my = nextReq('offers');
+  box.innerHTML = '<p class="muted">запрашиваю маркетплейс Clore… <span id="offers-wait"></span></p>';
   busy($('btn-offers'), true, 'ищу…');
+  // Clore иногда отвечает десятками секунд (лимит запросов, повторы) — показываем,
+  // что запрос жив, и не ждём бесконечно
+  const t0 = Date.now();
+  const waitTimer = setInterval(() => {
+    const el = $('offers-wait');
+    const sec = Math.floor((Date.now() - t0) / 1000);
+    if (el) el.textContent = sec >= 10 ? `${sec} с — Clore отвечает медленно, жду` : '';
+  }, 1000);
   try {
     // Поле «Поиск» сюда не уходит намеренно: берём широкую выборку один раз и дальше
     // фильтруем её на месте, чтобы ввод имени карты не требовал нового запроса к Clore
@@ -605,8 +786,11 @@ async function loadOffers() {
       // список и автоподбор расходились на ровном месте.
       cpu_moe: cpuMoeOn() ? '1' : '',
     });
-    if ($('f-price').value.trim()) q.set('max_price', $('f-price').value.trim());
-    state.offersData = await api('/api/offers?' + q);
+    if (price) q.set('max_price', price);
+    const data = await api('/api/offers?' + q, null, OFFERS_TIMEOUT_MS);
+    if (!isLatest('offers', my)) return;      // фильтры успели поменять и запросить снова
+    state.offersData = data;
+    state.offersSig = offersSig();
     // Цена и доступность могли измениться — подтягиваем свежие данные для уже выбранных.
     // Пропавших из выборки не выбрасываем: сервер мог просто не пройти новые фильтры,
     // а очередь задал пользователь, и чистить её за него незачем
@@ -614,12 +798,30 @@ async function loadOffers() {
     state.offers = state.offers.map((o) => fresh.get(o.id) || o);
     renderOffers();
     renderPlan();
-  } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
-  finally { busy($('btn-offers'), false); }
+  } catch (e) {
+    if (isLatest('offers', my)) {
+      // совет про блокировку уместен только для сетевых сбоев, а не для ошибки в фильтре
+      const net = /Clore|нет ответа|fetch/i.test(e.message);
+      box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}${net
+        ? '. Не нажимайте «Найти» повторно сразу: частые запросы продлевают блокировку Clore.' : ''}</p>`;
+    }
+  } finally { clearInterval(waitTimer); busy($('btn-offers'), false); }
+}
+
+// Список серверов подбирается сам — после выбора модели и при входе на вкладку «Сервер»,
+// без нажатия «Найти серверы». Сервер держит маркетплейс Clore скачанным заранее, так что
+// ответ приходит сразу и лишних запросов к Clore нет. Уже загруженный и актуальный список
+// не перезапрашиваем; если поиск уже идёт — не дублируем его
+function autoOffers() {
+  if (state.where !== 'clore' || Number($('btn-offers').dataset.busy || 0) > 0) return;
+  if (state.offersData && state.offersSig === offersSig()) return;
+  if (Number.isNaN(priceValue())) return;     // в поле цены ошибка — пусть исправят сами
+  loadOffers();
 }
 
 // ───────── план деплоя ─────────
 function renderPlan() {
+  updateStepNav();       // план меняется вместе с выбором модели и очереди — и готовность этапа
   const m = state.model, queue = state.offers;
   if (!m) { $('plan').innerHTML = '<p class="muted">Шаг 1: выберите модель на вкладке «Модель».</p>'; return; }
   $('need').innerHTML = `Модель <code>${esc(m.repo_id)}</code>: нужно ≈${m.vram_gib} GiB VRAM и ${m.disk_gb} GB диска, качать ${m.weights_gib} GiB.`;
@@ -632,7 +834,10 @@ function renderPlan() {
            первой, остальные отменю:`
         : 'очередь аренды — пробую по порядку, пока один не поднимется:'}</div>
        <ol class="muted plan-queue">${queue.map((o) => `<li>сервер ${o.id}:
-         ${o.gpu_count}× ${esc(o.gpu)}, ${o.vram_gb} GiB VRAM, ${fmtUsd(o.price_used)}</li>`).join('')}</ol>`
+         ${o.gpu_count}× ${esc(o.gpu)}, ${o.vram_gb} GiB VRAM, ${fmtUsd(o.price_used)}${vramShort(o)
+           ? ` <span class="warn-text">— мало VRAM для этого кванта (нужно ≈${needVram()} ГиБ)</span>` : ''}</li>`).join('')}</ol>
+       ${state.offersSig && state.offersSig !== offersSig()
+         ? '<div class="warn-text">⚠ цены в очереди — с прошлого поиска, а фильтры с тех пор менялись</div>' : ''}`
     : '<div class="muted" style="margin-top:6px">сервер не выбран — возьму самый выгодный из подходящих автоматически</div>';
   $('plan').innerHTML = `
     <div><b>${esc(m.repo_id)}</b> · ${esc(m.format)} → ${esc(m.engine)} · контекст ${fmtCtx(m.ctx)}</div>
@@ -643,6 +848,8 @@ function renderPlan() {
 // ───────── деплой ─────────
 async function startDeploy(dryRun) {
   if (!state.model) return toast('сначала выберите модель', true);
+  const price = priceValue();
+  if (Number.isNaN(price)) return toast('«Цена ≤ $/ч» на вкладке «Сервер» — число, например 0.5', true);
   const btn = dryRun ? $('btn-dry') : $('btn-deploy');
   busy(btn, true, dryRun ? 'проверяю…' : 'запускаю…');
   try {
@@ -651,8 +858,15 @@ async function startDeploy(dryRun) {
       ctx: $('model-ctx').value || state.model.ctx,
       server_ids: state.offers.map((o) => o.id),
       order_type: $('order-type').value,
-      max_price: $('f-price').value.trim() || null,
+      max_price: price,
       gpu_filter: $('f-gpu').value.trim(),
+      // Остальные фильтры вкладки «Сервер». Раньше автоподбор их не получал: список
+      // показывал одно (сеть от 0, старые GPU, RAM), а деплой искал по умолчаниям
+      min_vram: $('f-vram').value || '',
+      min_disk: $('f-disk').value || '',
+      min_net: $('f-net').value || '',
+      min_ram: $('f-ram').value || '',
+      old_gpu: Boolean($('f-old-gpu')?.checked),
       image: $('d-image').value.trim(),
       ssh_password: $('d-ssh').value.trim(),
       gguf_file: state.gguf_file || '',
@@ -662,30 +876,74 @@ async function startDeploy(dryRun) {
       dry_run: !!dryRun,
     });
     document.querySelector('.tab[data-tab="deploy"]').click();
+    state.jobSeenRunning = true;      // итог этой задачи покажем тостом, даже если она уже кончилась
+    // «арендовать ещё один» — разовое решение: оставленная галочка арендовала бы
+    // дополнительный сервер и в следующий раз
+    if (!dryRun) $('d-force').checked = false;
     pollJob();
     toast(dryRun ? 'проверка запущена' : 'деплой запущен — следите за логом');
   } catch (e) { toast(e.message, true); }
   finally { busy(btn, false); }
 }
 
+function renderJobPill(j) {
+  const pill = $('job-pill');
+  if (!pill) return;
+  pill.classList.toggle('hidden', !j?.running);
+  if (j?.running) {
+    pill.textContent = `${j.stopping ? 'останавливаю деплой' : 'идёт деплой'}${j.title ? ' · ' + j.title.split('/').pop() : ''} · ${Math.floor(j.elapsed / 60)} мин`;
+  }
+}
+
 function pollJob() {
   clearInterval(state.polling);
+  let fails = 0;
+  let lastState = 0;
   const tick = async () => {
     try {
-      const j = await api('/api/job');
+      const j = await api('/api/job', null, 8000);
+      fails = 0;
+      state.jobRunning = j.running;
+      renderJobPill(j);
       $('job-log').textContent = j.log.length ? j.log.join('\n') : '— ещё не запускалось —';
       $('job-log').scrollTop = $('job-log').scrollHeight;
       $('job-elapsed').textContent = j.running ? `· идёт ${Math.floor(j.elapsed / 60)} мин ${j.elapsed % 60} с` : '';
       $('btn-deploy').disabled = j.running;
-      $('btn-job-stop').classList.toggle('hidden', !j.running);
-      if (!j.running) {
+      $('btn-dry').disabled = j.running;
+      const stopBtn = $('btn-job-stop');
+      stopBtn.classList.toggle('hidden', !j.running);
+      // Пока поток деплоя отменяет то, что успел арендовать, кнопка показывает это,
+      // а не выглядит так, будто нажатие не сработало
+      stopBtn.disabled = Boolean(j.stopping);
+      stopBtn.textContent = j.stopping ? 'Останавливаю… (отменяю арендованное)' : 'Остановить деплой';
+      if (j.running) {
+        state.jobSeenRunning = true;
+        // Деплой пишет номер заказа в .env по ходу дела. Без этого карточка «Текущий
+        // сервер» до самого конца показывала прошлое состояние, и «Отменить заказ»
+        // отвечало «нет активного заказа» про уже оплачиваемый сервер
+        if (Date.now() - lastState > 10000) { lastState = Date.now(); loadState().catch(() => {}); }
+      } else {
         clearInterval(state.polling);
         state.polling = null;
         await loadState();
-        if (j.error) toast('деплой не завершён: ' + j.error, true);
-        else if (j.result?.status === 'ready') toast('модель готова: ' + j.result.api_url);
+        // Итог показываем, только если задача шла у нас на глазах. Раньше при каждой
+        // загрузке страницы всплывал тост про деплой часовой давности
+        if (state.jobSeenRunning) {
+          state.jobSeenRunning = false;
+          if (j.error) toast('деплой не завершён: ' + j.error, true);
+          else if (j.result?.status === 'ready') toast('модель готова: ' + j.result.api_url);
+          else if (j.result?.status === 'already-running') toast('модель уже работает — новый сервер не арендован');
+          else if (j.result?.status === 'stopped') toast('деплой остановлен');
+        }
       }
-    } catch (e) { /* UI не падает из-за одного опроса */ }
+    } catch (e) {
+      // Один неудачный опрос — не повод паниковать, три подряд — UI-сервер не отвечает
+      if (++fails >= 3) {
+        $('job-elapsed').innerHTML = '<span class="warn-text">· нет связи с UI-сервером (app.py) — деплой ' +
+          'больше не управляется отсюда. Если сервер был арендован, он оплачивается: ' +
+          'перезапустите UI или выполните python stop.py</span>';
+      }
+    }
   };
   tick();
   state.polling = setInterval(tick, 2500);
@@ -713,10 +971,16 @@ async function loadOrders() {
         </div>`;
       const use = item.querySelector('[data-act="use"]');
       if (use) use.onclick = async () => {
-        busy(use, true); try { const r = await api('/api/use', { order: o.id }); toast('переключено на ' + r.api_url); await loadState(); }
+        if (state.jobRunning) return toast('идёт деплой — переключаться на другой заказ можно после него', true);
+        busy(use, true); try {
+          const r = await api('/api/use', { order: o.id });
+          toast(`переключено на заказ ${o.id}: ${r.model ? r.model.split('/').pop() + ', ' : ''}контекст ${fmtCtx(r.ctx)}`);
+          if (r.warning) setTimeout(() => toast(r.warning, true), 4300);
+          await loadState();
+        }
         catch (e) { toast(e.message, true); } finally { busy(use, false); }
       };
-      item.querySelector('[data-act="cancel"]').onclick = () => cancelOrder(o.id);
+      item.querySelector('[data-act="cancel"]').onclick = (e) => cancelOrder(o.id, e.target);
       box.appendChild(item);
     });
   } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
@@ -741,16 +1005,25 @@ async function loadWallets() {
   } catch (e) { box.innerHTML = `<p class="muted">ошибка: ${esc(e.message)}</p>`; }
 }
 
-async function cancelOrder(order) {
+async function cancelOrder(order, btn) {
+  if (!order) await loadState().catch(() => {});   // номер в карточке мог устареть
   const id = order || state.env?.current?.order;
-  if (!id) return toast('нет активного заказа', true);
-  if (!confirm(`Отменить заказ ${id}? Сервер освободится, скачанная модель будет удалена.`)) return;
+  if (!id) {
+    return toast(state.jobRunning
+      ? 'деплой ещё не арендовал сервер — чтобы прервать его, нажмите «Остановить деплой»'
+      : 'нет активного заказа', true);
+  }
+  const ofJob = state.jobRunning && String(id) === String(state.env?.current?.order);
+  if (!confirm(`Отменить заказ ${id}?${ofJob ? ' Это сервер идущего деплоя — деплой остановится.' : ''}
+Сервер освободится, скачанная модель будет удалена.`)) return;
+  busy(btn, true, 'отменяю…');
   try {
     await api('/api/cancel', { order: id });
     toast(`заказ ${id} отменён`);
     await loadState();
     loadOrders();
   } catch (e) { toast(e.message, true); }
+  finally { busy(btn, false); }
 }
 
 // ───────── настройки ─────────
@@ -1019,6 +1292,7 @@ function setWhere(w) {
   // открытая вкладка могла исчезнуть вместе с режимом — возвращаемся к выбору модели
   const active = document.querySelector('.tab.active');
   if (active && getComputedStyle(active).display === 'none') document.querySelector('.tab[data-tab="model"]').click();
+  updateStepNav();
   if (w === 'pc') {
     if (!state.pc) loadPc();
     loadLocal();
@@ -1072,18 +1346,20 @@ async function claudeTo(target, where, box, btn) {
         <p class="muted">Адрес ${copy(r.base_url)} · модель ${copy(r.model)} · файлы: <code>${esc(r.dir)}</code></p>
         <button class="ghost" data-desktop-off>Убрать из Claude Desktop</button>
       </div>`;
-      box.querySelector('[data-desktop-off]').onclick = async (e) => {
-        try {
-          const x = await api('/api/claude/desktop-off', {});
-          box.innerHTML = `<p class="muted">${x.removed ? 'Настройка убрана' : 'Нашей настройки там уже нет'} —
-            перезапустите Claude Desktop.</p>`;
-        } catch (err) { toast(err.message, true); }
-      };
+      box.querySelector('[data-desktop-off]').onclick = () => claudeDesktopOff(box);
     }
     box.querySelectorAll('.copy').forEach((n) => (n.onclick = () => {
       navigator.clipboard.writeText(n.dataset.copy || ''); toast('скопировано');
     }));
   } catch (e) { toast(e.message, true); } finally { busy(btn, false); }
+}
+
+async function claudeDesktopOff(box) {
+  try {
+    const x = await api('/api/claude/desktop-off', {});
+    box.innerHTML = `<p class="muted">${x.removed ? 'Настройка убрана' : 'Нашей настройки там уже нет'} —
+      перезапустите Claude Desktop.</p>`;
+  } catch (err) { toast(err.message, true); }
 }
 
 // ───────── запуск на своём ПК ─────────
@@ -1095,15 +1371,20 @@ async function installLocal() {
   if (!m) return toast('сначала выберите модель', true);
   const row = (m.local?.options || []).find((r) => r.path === state.gguf_file) || m.local?.best;
   if (!row?.mode) return toast('этот квант на этот ПК не влезает — выберите другой', true);
+  if (state.localJob?.running) return toast('уже идёт установка — дождитесь её или остановите', true);
   if (!confirm(`Скачать и запустить ${m.repo_id}\n${row.label} — ${row.weights_gib} ГиБ, ` +
     `${MODE_NAME[row.mode]}, контекст ${fmtCtx(row.ctx)}\nИзоляция: ${ISO_NAME[$('local-iso').value]}`)) return;
+  const btn = $('model-card').querySelector('.local-install');
+  busy(btn, true, 'запускаю…');
   try {
     await api('/api/local/run', { ref: m.repo_id, gguf_file: row.path, ctx: $('model-ctx').value || '',
       isolation: $('local-iso').value });
+    state.localSeenRunning = true;
     document.querySelector('.tab[data-tab="pc"]').click();
     pollLocal();
     toast('установка началась — лог на вкладке «Мой ПК»');
   } catch (e) { toast(e.message, true); }
+  finally { busy(btn, false); }
 }
 
 function renderLocal(s) {
@@ -1125,10 +1406,14 @@ function renderLocal(s) {
   $('local-iso-note').innerHTML = $('local-iso').value === 'docker'
     ? 'Сильнее изолирован: даже обход ограничений процесса оставит атакующего внутри виртуальной машины Docker.'
     : 'Ставить ничего не нужно. Скорость полная. Файлы — в <code>' + esc(s.dir) + '</code>.';
-  if (!r.running) {
+  if (!r.running && state.localJob?.running) {
+    box.innerHTML = `<p class="muted">Идёт установка <code>${esc(state.localJob.title || '')}</code> — ход в логе ниже.</p>`;
+  } else if (!r.running) {
     box.innerHTML = '<p class="muted">Модель на этом ПК не запущена. Выберите модель на вкладке «Модель» — ' +
       'в карточке появится кнопка «Поставить на этот ПК».</p>';
   } else {
+    // Блок с инструкциями Claude переживает перерисовку (её запускает опрос состояния)
+    const claudeKeep = $('local-claude')?.innerHTML || '';
     const fw = s.firewall;
     box.innerHTML = `<div class="grid">
         <div class="kv"><b>${esc(r.repo)}</b><span>${esc(r.file)}</span></div>
@@ -1152,6 +1437,14 @@ function renderLocal(s) {
         ${s.windows && r.isolation === 'native' && !fw ? '<button class="ghost" id="btn-local-fw" title="Правило брандмауэра Windows: llama-server не сможет ничего отправить в интернет. Windows спросит права администратора">Закрыть ему интернет</button>' : ''}
       </div>
       <div id="local-claude"></div>`;
+    if (claudeKeep) {
+      $('local-claude').innerHTML = claudeKeep;
+      $('local-claude').querySelectorAll('.copy').forEach((n) => (n.onclick = () => {
+        navigator.clipboard.writeText(n.dataset.copy || ''); toast('скопировано');
+      }));
+      const off = $('local-claude').querySelector('[data-desktop-off]');
+      if (off) off.onclick = () => claudeDesktopOff($('local-claude'));
+    }
     $('btn-local-cc').onclick = (e) => claudeTo('cli', 'local', $('local-claude'), e.target);
     $('btn-local-cd').onclick = (e) => claudeTo('desktop', 'local', $('local-claude'), e.target);
     box.querySelectorAll('.copy').forEach((n) => (n.onclick = () => {
@@ -1187,9 +1480,12 @@ function renderLocal(s) {
     const row = el('div', 'variant');
     row.innerHTML = `<b>${esc(m.repo)}</b><span class="muted">${m.files.map(esc).join(', ')} · ${m.gib} ГиБ</span>
       <button class="danger">Удалить</button>`;
-    row.querySelector('button').onclick = async () => {
+    row.querySelector('button').onclick = async (e) => {
+      if (state.localJob?.running) return toast('идёт установка — удалять модели можно после неё', true);
       if (!confirm(`Удалить ${m.repo} (${m.gib} ГиБ) с диска?`)) return;
-      try { await api('/api/local/delete', { repo: m.repo }); loadLocal(); } catch (e) { toast(e.message, true); }
+      busy(e.target, true, 'удаляю…');
+      try { await api('/api/local/delete', { repo: m.repo }); loadLocal(); }
+      catch (err) { toast(err.message, true); busy(e.target, false); }
     };
     $('local-models').appendChild(row);
   });
@@ -1205,6 +1501,9 @@ function pollLocal() {
   const tick = async () => {
     try {
       const j = await api('/api/local/job');
+      const wasRunning = state.localJob?.running;
+      state.localJob = j;
+      if (j.running && !wasRunning) loadLocal();   // показать «идёт установка» вместо «не запущена»
       if (j.log.length) {
         $('local-log').textContent = j.log.join('\n');
         $('local-log').scrollTop = $('local-log').scrollHeight;
@@ -1213,8 +1512,12 @@ function pollLocal() {
       if (!j.running) {
         clearInterval(localPoll);
         localPoll = null;
-        if (j.error) toast('не запустилось: ' + j.error, true);
-        else if (j.result?.status === 'ready') toast('модель на этом ПК готова');
+        // итог — только если установка шла у нас на глазах, а не при каждом входе в режим ПК
+        if (state.localSeenRunning || wasRunning) {
+          state.localSeenRunning = false;
+          if (j.error) toast('не запустилось: ' + j.error, true);
+          else if (j.result?.status === 'ready') toast('модель на этом ПК готова');
+        }
         loadLocal();
       }
     } catch (e) { /* один неудачный опрос — не повод ломать страницу */ }
@@ -1257,10 +1560,10 @@ $('btn-opencode').onclick = async () => {
   try {
     const { paths } = await api('/api/opencode', {});
     // путь показываем прямо в карточке: при проблеме «модели нет в списке» ищут именно его
-    $('current').insertAdjacentHTML('beforeend',
-      `<p class="muted">Провайдер записан в <code>${esc(paths[0])}</code>${
+    state.opencodeNote = `<p class="muted">Провайдер записан в <code>${esc(paths[0])}</code>${
         paths.length > 1 ? ` и ещё ${paths.length - 1} копии` : ''}. Перезапустите OpenCode
-        и выберите провайдера «uncensored».</p>`);
+        и выберите провайдера «uncensored».</p>`;
+    renderCurrent();
     toast('конфиг OpenCode обновлён');
   } catch (e) { toast(e.message, true); }
   finally { busy($('btn-opencode'), false); }
@@ -1272,17 +1575,28 @@ $('f-cpu-moe').onchange = () => { applyNeed(); loadOffers(); };
 // Фильтр применяется к уже загруженному списку — поэтому мгновенно и без запроса к Clore
 $('f-gpu').oninput = () => { if (state.offersData) renderOffers(); };
 $('f-gpu').onkeydown = (e) => { if (e.key === 'Enter') loadOffers(); };
-$('order-type').onchange = renderPlan;
+$('order-type').onchange = refreshOffersView;
+// фильтры: сам список не перезапрашиваем (это запрос к Clore), но помечаем его устаревшим
+['f-vram', 'f-disk', 'f-net', 'f-ram', 'f-price'].forEach((id) => { $(id).addEventListener('change', refreshOffersView); });
+if ($('f-old-gpu')) $('f-old-gpu').addEventListener('change', refreshOffersView);
 $('btn-deploy').onclick = () => startDeploy(false);
 $('btn-dry').onclick = () => startDeploy(true);
-$('btn-cancel').onclick = () => cancelOrder();
+$('btn-cancel').onclick = (e) => cancelOrder(null, e.target);
 $('d-race').onchange = renderPlan;
 $('btn-job-stop').onclick = async () => {
   if (!confirm('Остановить деплой? Заказы, которые он успел арендовать, будут отменены.')) return;
+  const btn = $('btn-job-stop');
+  btn.disabled = true;
+  btn.textContent = 'Останавливаю…';
   try {
     await api('/api/deploy/stop', {});
-    toast('останавливаю — деплой сам отменит серверы, которые арендовал (см. лог)');
-  } catch (e) { toast(e.message, true); }
+    toast('останавливаю — если сервер уже арендован, деплой сам отменит его (см. лог)');
+    if (!state.polling) pollJob();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Остановить деплой';
+    toast(e.message, true);
+  }
 };
 $('btn-orders').onclick = loadOrders;
 $('btn-wallets').onclick = loadWallets;
@@ -1310,11 +1624,16 @@ $('btn-pc-scan').onclick = scanPc;
 $('local-iso').onchange = () => { localStorage.setItem('iso', $('local-iso').value); loadLocal(); };
 if (localStorage.getItem('iso')) $('local-iso').value = localStorage.getItem('iso');
 $('btn-local-stop').onclick = async () => {
+  const installing = state.localJob?.running;
+  if (!confirm(installing ? 'Прервать установку и остановить модель на этом ПК?'
+    : 'Остановить модель на этом ПК? Клиенты, которые к ней подключены, потеряют связь.')) return;
+  busy($('btn-local-stop'), true, 'останавливаю…');
   try {
     const r = await api('/api/local/stop', {});
-    toast(r.stopped ? 'модель остановлена' : 'остановлено');
+    toast(r.stopped ? 'модель остановлена' : installing ? 'установка прерывается — см. лог' : 'на этом ПК ничего не запущено');
     loadLocal();
   } catch (e) { toast(e.message, true); }
+  finally { busy($('btn-local-stop'), false); }
 };
 $('btn-pc-save').onclick = async () => {
   busy($('btn-pc-save'), true, 'сохраняю…');
@@ -1327,6 +1646,12 @@ $('btn-pc-save').onclick = async () => {
   finally { busy($('btn-pc-save'), false); }
 };
 setWhere(state.where);
+if ($('job-pill')) {
+  $('job-pill').onclick = () => {
+    if (state.where !== 'clore') setWhere('clore');
+    document.querySelector('.tab[data-tab="deploy"]').click();
+  };
+}
 
 loadState().then(() => { state.booted = true; return searchModels(); }).catch((e) => toast(e.message, true));
 pollJob();

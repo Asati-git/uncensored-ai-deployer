@@ -243,6 +243,20 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   padding: 10px 16px; opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 70vw;
 }
 #toast.show { opacity: 1; }
+
+/* ───────── навигация по этапам (справа снизу) ───────── */
+#stepnav {
+  position: fixed; right: 18px; bottom: 18px; z-index: 50; display: flex; gap: 8px;
+  padding: 8px; border-radius: 12px; background: color-mix(in srgb, var(--panel) 92%, transparent);
+  border: 1px solid var(--line); box-shadow: 0 6px 24px rgb(0 0 0 / .35); backdrop-filter: blur(6px);
+}
+#stepnav button { white-space: nowrap; }
+#stepnav button.hidden { display: none; }
+/* этап выполнен — следующий шаг подсвечен, чтобы взгляд сразу шёл к нему */
+#step-next.ready { animation: step-pulse 1.6s ease-in-out 3; box-shadow: 0 0 0 2px var(--accent); }
+@keyframes step-pulse { 50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 35%, transparent); } }
+/* место под панель, чтобы она не закрывала низ страницы */
+body { padding-bottom: 72px; }
 #toast.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--panel)); color: var(--bad); }
 
 /* ───────── режим «Мой ПК» ───────── */
@@ -267,3 +281,9 @@ body.mode-pc .only-clore, body:not(.mode-pc) .only-pc { display: none; }
 .pc-group { margin-top: 12px; }
 .pc-group h3 { font-size: 14px; margin: 0 0 6px; }
 .pc-group .variant { margin: 4px 0; }
+/* нативный контекст модели в подборке: длинный выделяем, короткий приглушаем */
+.badge.ctx { margin-left: 5px; vertical-align: 1px; }
+.badge.ctx.long { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 32%, var(--panel)); font-weight: 600; }
+.badge.ctx.short { background: transparent; color: var(--muted);
+  border-color: color-mix(in srgb, var(--muted) 30%, var(--panel)); }

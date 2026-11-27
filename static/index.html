@@ -24,6 +24,11 @@
       <button data-where="clore" class="on" title="Арендовать сервер с видеокартой на Clore.ai">☁ Сервер Clore</button>
       <button data-where="pc" title="Показать, какие модели поднимутся на этом компьютере без аренды">🖥 Мой ПК</button>
     </div>
+    <!-- язык интерфейса; лог деплоя остаётся на русском -->
+    <div class="segmented where" id="lang" title="Язык интерфейса">
+      <button data-lang="ru">RU</button><button data-lang="en">EN</button>
+    </div>
+    <span id="job-pill" class="pill warn hidden" style="cursor:pointer" title="Открыть лог деплоя"></span>
     <span id="status-pill" class="pill">проверяю…</span>
     <button id="btn-refresh" class="ghost" title="Обновить состояние">⟳</button>
   </div>
@@ -128,7 +133,7 @@
 
     <div class="row">
       <input id="model-ref" type="text" placeholder="https://huggingface.co/owner/model-name  или  owner/model-name" spellcheck="false">
-      <input id="model-ctx" type="number" placeholder="контекст" min="2048" step="1024" title="Контекст. По умолчанию берётся нативный из конфига модели, но не больше 131072: на полном контексте KV-кэш требует больше VRAM, чем сама модель. Изменение применяется сразу — VRAM и список серверов пересчитываются">
+      <input id="model-ctx" type="number" placeholder="контекст" min="2048" step="1024" title="Контекст. По умолчанию берётся нативный из конфига модели (у Qwen3.8 — 262k, у GLM-5.3 и DeepSeek V4 — 1M), а урезается, только если KV-кэш на нём дороже 16 GiB. Изменение применяется сразу — VRAM и список серверов пересчитываются">
       <button id="btn-pick" class="primary">Выбрать</button>
     </div>
     <div id="model-card" class="model-card hidden"></div>
@@ -358,7 +363,16 @@
   </div>
 </section>
 
+<!-- навигация по этапам: всегда под рукой, не нужно тянуться к вкладкам наверху -->
+<nav id="stepnav" aria-label="Этапы">
+  <button id="step-prev" class="ghost"></button>
+  <button id="step-next" class="primary"></button>
+</nav>
+
 <div id="toast"></div>
+<script src="/i18n-ui.js"></script>
+<script src="/i18n-errors.js"></script>
+<script src="/i18n.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

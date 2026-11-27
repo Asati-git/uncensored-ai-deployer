@@ -38,12 +38,17 @@ ENGINE_VLLM = "vllm"          # safetensors fp16/awq/gptq/fp8 -> vLLM
 
 GIB = 1024 ** 3
 
-# Контекст по умолчанию. Берём нативный из конфига модели, но с потолком: у свежих Qwen
-# заявлены 262k, а с YaRN и до 1M, и на таком контексте один KV-кэш требует больше VRAM,
-# чем сама модель — подбор уезжает в мультиGPU там, где он не нужен. Потолок снимается
-# вручную: поле «контекст» в UI или --ctx в CLI принимают любое значение до ctx_max.
+# Контекст по умолчанию — нативный из конфига модели, если его KV-кэш не дороже
+# KV_BUDGET_GIB. Раньше стоял жёсткий потолок 131k, и агенту (OpenCode) его не хватало:
+# сессия постоянно сжималась, хотя у Qwen3.8 нативно 262k, а у GLM-5.3 и DeepSeek V4 — 1M.
+# Причём у свежих гибридных и MLA-моделей полный контекст почти бесплатен: Qwen3.8-27B
+# на 262k — +4 ГиБ к 131k, GLM-5.3 Flash на 1M — 5.5 ГиБ всего. Дорогой KV (плотные
+# модели со старым вниманием) урезаем вдвое, пока не впишется, но не ниже CTX_CAP.
+# Под конкретный сервер контекст потом ещё подгоняет ctx_for_vram. Вручную — поле
+# «контекст» в UI или --ctx в CLI, любое значение до ctx_max.
 DEFAULT_CTX = 32768
 CTX_CAP = 131072
+KV_BUDGET_GIB = 16
 
 
 # ---------- HTTP ----------
@@ -286,6 +291,19 @@ TOP_CODING = [
                        "собственные замеры.",
                 "variants": ["DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-"
                              "Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF"],
+            },
+            {
+                "title": "Ternary Bonsai 2.5 27B",
+                "tier": "самая лёгкая 27B, с цензурой",
+                "base": "Qwen3.8-27B в тернарных весах (Prism ML), плотная 27.4B, выпуск от 2026-11",
+                "why": "Тот же Qwen3.8-27B, но веса сжаты до трёх значений: файл 7.1 ГиБ "
+                       "против 16.8 у Q4_K_M, хватает самой дешёвой карты на 12 ГБ. "
+                       "Вызовы инструментов по независимому тесту предыдущей версии не "
+                       "хуже оригинала, на трудных задачах — около 87% его результата: "
+                       "берите ради цены и скорости, а не ради качества. Не "
+                       "расцензурена. Версии 2.5 несколько дней, её цифры — заявления "
+                       "авторов.",
+                "variants": ["prism-ml/Ternary-Bonsai-2.5-27B-GGUF"],
             },
             {
                 "title": "Qwen3-Coder-Next",
@@ -571,6 +589,21 @@ TOP_ECONOMY = [
                "оперативке на той же карте окажется умнее.",
         "models": [
             {
+                "title": "Ternary Bonsai 2.5 27B",
+                "tier": "27B в карте на 12 ГБ, с цензурой",
+                "base": "Qwen3.8-27B в тернарных весах (Prism ML), плотная 27.4B, выпуск от 2026-11",
+                "why": "Qwen3.8-27B, сжатый до трёх значений на вес: файл 7.1 ГиБ вместо "
+                       "15.4 у Q4_K_M, поэтому модель класса 24 ГБ целиком входит в карту "
+                       "на 12 ГБ. Проверено на RTX с 12 ГБ: 7.7 ГиБ видеопамяти при "
+                       "контексте 32k, 48 токенов в секунду, вызовы инструментов работают "
+                       "на обычном llama.cpp. По независимому тесту предыдущей версии "
+                       "вызовы инструментов не хуже обычного Qwen, а на трудных задачах "
+                       "решает примерно 87% от его результата. Версии 2.5 несколько "
+                       "дней, её собственные цифры — заявления авторов; долго размышляет. "
+                       "Расцензуренной сборки нет.",
+                "variants": ["prism-ml/Ternary-Bonsai-2.5-27B-GGUF"],
+            },
+            {
                 "title": "Gemma 4 12B",
                 "tier": "чат и лёгкие правки",
                 "base": "Gemma-4-12B-it (Google), плотная 11.9B, база от 2026-05",
@@ -702,9 +735,28 @@ def _meta_card(repo_id, token=None):
         ("expand[]", "downloadsAllTime"), ("expand[]", "trendingScore"),
         ("expand[]", "createdAt"), ("expand[]", "likes"),
         ("expand[]", "tags"), ("expand[]", "gated"),
+        # у GGUF Hugging Face сам читает контекст из файла — без отдельного запроса
+        ("expand[]", "gguf"),
     ])
     item = _get(f"models/{urllib.parse.quote(repo_id)}?{q}", token)
-    return _card(item)
+    card = _card(item)
+    card["ctx_max"] = int((item.get("gguf") or {}).get("context_length") or 0) or None
+    if not card["ctx_max"] and card["format"] != "gguf":
+        card["ctx_max"] = _ctx_from_config(repo_id, token)
+    return card
+
+
+_CTX_MEMO = {}
+
+
+def _ctx_from_config(repo_id, token=None):
+    """Нативный контекст safetensors-модели из её config.json. Он не меняется — запоминаем."""
+    if repo_id not in _CTX_MEMO:
+        cfg = _raw_config(repo_id, token)
+        if not cfg:
+            return None         # сбой сети не запоминаем — спросим в следующий раз
+        _CTX_MEMO[repo_id] = model_max_ctx(cfg)
+    return _CTX_MEMO[repo_id]
 
 
 def top_coding(fmt=None, token=None, limit=None, kind=DEFAULT_TOP):
@@ -748,6 +800,8 @@ def top_coding(fmt=None, token=None, limit=None, kind=DEFAULT_TOP):
                 "params_b": next((v["params_b"] for v in variants if v["params_b"]), None),
                 "trending": head["trending"], "format": head["format"],
                 "bpw": head["bpw"], "gated": any(v["gated"] for v in variants),
+                # нативный контекст: у вариантов одной модели он один, берём известный
+                "ctx_max": max((v.get("ctx_max") or 0 for v in variants), default=0) or None,
             })
         if not models:
             continue
@@ -957,6 +1011,22 @@ def kv_cache_gib(cfg, ctx, engine):
     return round(attn_layers * per_token * ctx * nbytes / GIB, 1)
 
 
+def default_ctx(cfg, ctx_max, engine):
+    """Контекст по умолчанию: нативный, если KV-кэш укладывается в KV_BUDGET_GIB (см. выше)."""
+    if not ctx_max:
+        return DEFAULT_CTX
+    floor = min(ctx_max, CTX_CAP)
+    ctx = ctx_max
+    while ctx > floor:
+        kv = kv_cache_gib(cfg, ctx, engine)
+        if kv is None:          # устройство внимания неизвестно — по-старому, с потолком
+            return floor
+        if kv <= KV_BUDGET_GIB:
+            break
+        ctx //= 2
+    return max(ctx, floor)
+
+
 def model_max_ctx(cfg):
     """
     Нативный контекст модели — из её конфига.
@@ -998,12 +1068,16 @@ _SHARD_RE = re.compile(r"-0*\d+-of-0*\d+\.gguf$", re.I)
 #
 # В репозиториях 2026 года прибавилось ещё несколько видов не-моделей с расширением .gguf:
 # патчи поверх чужих квантов («…-patch-all-3.gguf», целая папка patch-*), головы для
-# ускоренного декодирования (FastMTP, dflash) и тернарные сборки (Ternary-Bonsai, PTQ),
+# ускоренного декодирования (FastMTP, dflash) и тернарные упаковки PTQ1_0 / PQ2_0,
 # которым нужен отдельный форк llama.cpp. На живой проверке подборки патч в 0.6 ГиБ
 # выбирался как «лучший квант для этого ПК» у модели на 27B.
+#
+# Сами тернарные модели (Ternary-Bonsai) при этом не служебные: их упаковка Q2_0 — обычный
+# тип llama.cpp и запускается штатной сборкой. Поэтому отсекаем по упаковке, а не по слову
+# «ternary» в имени: иначе в репозитории, где тернарное всё, не остаётся ни одного файла.
 _AUX_GGUF_RE = re.compile(
     r"(^|/)(mmproj|mtp[-_]|.*imatrix|.*[-_]lora|.*refusal[-_]direction|dflash|patch[-_][^/]*/)"
-    r"|[-_]draft\b|[-_]patch\.gguf$|[-_]patch[-_][\w-]*\.gguf$|fastmtp|ternary|bonsai|[-_]ptq\d", re.I)
+    r"|[-_]draft\b|[-_]patch\.gguf$|[-_]patch[-_][\w-]*\.gguf$|fastmtp|[-_]p(?:tq|q)\d[._]\d", re.I)
 # Предпочтительный квант для кода: ниже Q4_K_M заметно сыпется генерация.
 # Имена в репозиториях разнородные (Q4_K_M, Q4_K-0731, q4km), поэтому ищем регулярками.
 _QUANT_RANK = [r"q4[._-]?k[._-]?m", r"q4[._-]?k", r"q5[._-]?k[._-]?m", r"q5[._-]?k",
@@ -1011,7 +1085,7 @@ _QUANT_RANK = [r"q4[._-]?k[._-]?m", r"q4[._-]?k", r"q5[._-]?k[._-]?m", r"q5[._-]
 
 # Примерная «ширина» кванта в битах на вес — по ней отсекаем мусорные варианты.
 _QUANT_BPW = [
-    (r"iq1\w*", 1.8), (r"iq2\w*", 2.5), (r"q2[._-]?k\w*", 2.6), (r"q2", 2.6),
+    (r"iq1\w*", 1.8), (r"iq2\w*", 2.5), (r"q2[._-]?k\w*", 2.6), (r"q2[._-]0", 2.25), (r"q2", 2.6),
     (r"iq3\w*", 3.3), (r"q3[._-]?k\w*", 3.5), (r"q3", 3.5),
     (r"mxfp4", 4.25), (r"iq4[._-]?xs", 4.3), (r"iq4[._-]?nl", 4.5), (r"iq4", 4.3),
     (r"q4[._-]?0", 4.5), (r"q4[._-]?1", 5.0),
@@ -1263,6 +1337,12 @@ def _gguf_options(entries, ctx, kv_gib, moe=None, vocab=0):
             opt["vram_cpu_moe_gib"] = off["vram_gib"]
             opt["ram_gb"] = off["ram_gb"]
         out.append(opt)
+    # «…-Q2_0-mtp.gguf» рядом с «…-Q2_0.gguf» — та же модель со встроенной головой для
+    # ускоренного декодирования. Мы её не включаем, так что это те же веса плюс лишние
+    # сотни мегабайт. Убираем только пару: если версии без головы нет, файл остаётся.
+    plain = {o["label"].lower() for o in out}
+    out = [o for o in out
+           if not (re.search(r"[-_.]mtp$", o["label"], re.I) and o["label"][:-4].lower() in plain)]
     out.sort(key=lambda o: o["weights_gib"])
     return out
 
@@ -1296,6 +1376,10 @@ _TRAINED_QUANT_RE = re.compile(r"gsq|[-_]rco[-_]|rco[-_]gguf", re.I)
 # Но и у обученных квантов есть предел: по замерам ISTA-DASLab 2.5 bpw даёт top-1 88% —
 # для кода это уже ощутимо, а 3.5 bpw держит 93%. Пропускаем IQ3 и выше, IQ2 отсекаем.
 TRAINED_MIN_BPW = 3.3
+# Тернарные модели (веса −1/0/+1) — не «сильно пережатый» обычный квант: их доводят
+# обучением уже в этом формате, и 2 бита для них родная ширина. Общий порог к ним
+# неприменим вовсе — других квантов у такой модели не бывает.
+_TERNARY_RE = re.compile(r"ternary|bonsai", re.I)
 
 
 def _usable_quants(options):
@@ -1308,7 +1392,8 @@ def _usable_quants(options):
     """
     good = [o for o in options
             if o["bpw"] is None or o["bpw"] >= MIN_CODE_BPW
-            or (_TRAINED_QUANT_RE.search(o["label"]) and o["bpw"] >= TRAINED_MIN_BPW)]
+            or (_TRAINED_QUANT_RE.search(o["label"]) and o["bpw"] >= TRAINED_MIN_BPW)
+            or _TERNARY_RE.search(o["label"])]
     if good:
         return _drop_drafts(good), False
     return _drop_drafts(options), True
@@ -1377,7 +1462,7 @@ def model_info(ref, ctx=None, token=None):
     own_cfg = _raw_config(repo_id, token)   # собственный конфиг: из него берём квантование
     cfg = _config_with_base(repo_id, meta, own_cfg, token)
     ctx_max = model_max_ctx(cfg)
-    ctx = int(ctx) if ctx else min(ctx_max or DEFAULT_CTX, CTX_CAP)
+    ctx = int(ctx) if ctx else default_ctx(cfg, ctx_max, engine)
     if ctx_max:
         ctx = min(ctx, ctx_max)      # больше, чем умеет модель, движок всё равно не даст
     vocab = int(cfg.get("vocab_size") or 0)
@@ -1442,7 +1527,7 @@ def model_info(ref, ctx=None, token=None):
         "gguf_low_only": low_only,                      # годных нет вообще — показываем как есть
         "ctx": ctx,
         "ctx_max": ctx_max,     # нативный потолок модели; None — в конфиге не нашлось
-        "ctx_capped": bool(ctx_max and ctx_max > CTX_CAP),  # дефолт урезан нашим потолком
+        "ctx_capped": bool(ctx_max and ctx < ctx_max),  # берём меньше, чем умеет модель
         "vocab": vocab,
         # число слоёв: по нему локальный запуск считает -ngl при частичной выгрузке
         "layers": int(cfg.get("num_hidden_layers") or cfg.get("n_layer") or 0),

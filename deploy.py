@@ -327,8 +327,51 @@ def tg(env, text):
         log(f"TG ошибка: {e}")
 
 
-def client(env):
-    return Clore(env.get("CLORE_API_KEY") or "")
+def client(env, stop=None):
+    # stop прокидывается в клиент: ожидание ответа Clore (повторы, паузы) обрывается
+    # кнопкой «Стоп», а не досиживается до конца — до аренды это минуты при сбоях сети
+    return Clore(env.get("CLORE_API_KEY") or "", stop=stop, stop_exc=DeployStopped)
+
+
+def wait_clore(clore, logf=log, stop=None):
+    """Clore на паузе после сбоя связи — дождаться её конца (с учётом «Стоп»)."""
+    from clore import blocked_for
+    left = blocked_for(clore.api_key)
+    if left > 0:
+        logf(f"Clore не отвечал — жду {left} с паузы и продолжаю (сервер не пропускаю)")
+        nap(left + 1, stop)
+
+
+def patient(fn, clore, logf=log, stop=None, tries=3):
+    """
+    Запрос к Clore до аренды (проверка заказов, баланс, список серверов). Если Clore
+    оборвал связь или попросил подождать — запрос не выполнен, ничего не арендовано и
+    повтор безопасен. Раньше деплой на этом сразу падал, и человек жал кнопку снова,
+    продлевая паузу. Теперь ждём её конца сами и повторяем.
+    """
+    from clore import blocked_for
+    for attempt in range(tries):
+        try:
+            return fn()
+        except CloreError as e:
+            if not getattr(e, "not_sent", False) or attempt == tries - 1:
+                raise
+            pause = max(blocked_for(clore.api_key), 10 * (attempt + 1))
+            logf(f"Clore не ответил — ничего не арендовано, жду {pause} с и повторяю "
+                 f"(попытка {attempt + 2} из {tries}). Кнопки нажимать не нужно")
+            nap(pause + 1, stop)
+
+
+def nap(sec, stop=None):
+    """Пауза, которую обрывает «Стоп». Деплой спит между опросами по 10–30 с, и раньше
+    нажатая кнопка ждала конца такой паузы, а то и нескольких."""
+    end = time.time() + sec
+    while True:
+        check_stop(stop)
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, 0.5))
 
 
 # ---------- startup-скрипт ----------
@@ -451,6 +494,54 @@ def api_alive(url, key, timeout=10):
         return bool(d.get("data"))
     except Exception:
         return False
+
+
+def order_model(host, ports, api_url, key, timeout=6):
+    """
+    Какая модель стоит на сервере заказа: {"repo", "ctx", "engine"}, неизвестное — пусто.
+    Нужна кнопке «Использовать»: раньше она переключала только адрес, а модель, контекст
+    и движок оставались от прошлого деплоя — и OpenCode/Claude получали чужой контекст.
+    Модель и формат — со статус-порта (заказы новых версий сообщают их сами). Контекст —
+    у самого движка, если он его называет: статус-порт помнит значение со старта
+    сервера, а движок могли перезапустить с другим -c.
+    """
+    out = {"repo": "", "ctx": 0, "engine": ""}
+
+    def get(url, auth=False):
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if auth else {})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+
+    sp = ports.get(STATUS_PORT)
+    if host and sp:
+        try:
+            d = get(f"http://{host}:{sp}/")
+            out["repo"] = str(d.get("repo") or "")
+            out["ctx"] = int(d.get("ctx") or 0)
+            if d.get("format"):
+                out["engine"] = hfmodels.engine_for(str(d["format"]))
+        except Exception:  # noqa — старый заказ или порт закрыт: пробуем движок
+            pass
+    # llama.cpp: /props знает фактический контекст — он главнее статус-порта
+    try:
+        d = get(api_url.rsplit("/v1", 1)[0] + "/props", auth=True)
+        n = (d.get("default_generation_settings") or {}).get("n_ctx") or d.get("n_ctx")
+        if n:
+            out["ctx"] = int(n)
+            out["engine"] = out["engine"] or hfmodels.ENGINE_LLAMACPP
+    except Exception:  # noqa
+        pass
+    # vLLM: max_model_len в списке моделей
+    if not out["ctx"]:
+        try:
+            for m in get(api_url + "/models", auth=True).get("data") or []:
+                if m.get("max_model_len"):
+                    out["ctx"] = int(m["max_model_len"])
+                    out["engine"] = out["engine"] or hfmodels.ENGINE_VLLM
+                    break
+        except Exception:  # noqa
+            pass
+    return out
 
 
 def bench(url, key, model=MODEL_NAME):
@@ -624,7 +715,7 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
                 gpu_filter=None, order_type="on-demand", min_net=MIN_NET_DOWN_MBPS,
                 download_gib=0, limit=25, engine=None, quant=None, allow_old_gpu=False,
                 balance_usd=None, min_reliability=MIN_RELIABILITY, spread=False,
-                hidden=None, blacklist=None, need_ram=0, cpu_moe=False):
+                hidden=None, blacklist=None, need_ram=0, cpu_moe=False, servers=None):
     """
     Серверы, которые вместят модель, отсортированные по цене в USD с учётом времени скачивания.
     engine/quant — чтобы отсеять карты, на которых выбранный движок не заведётся
@@ -651,7 +742,10 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
     иначе все выбирают один и тот же самый дешёвый сервер, дерутся за него и получают
     отказ «уже арендован». Без флага перемешиваются только точные совпадения по цене.
     """
-    servers = clore.marketplace()
+    # servers можно передать готовыми: маркетплейс весит мегабайты, и вызывающий,
+    # которому он уже понадобился для курсов, не должен качать его второй раз
+    if servers is None:
+        servers = clore.marketplace()
     rates = clore.currency_rates(servers)
     banned = blacklist_ids() if blacklist is None else {int(x) for x in blacklist}
     skip = hidden if hidden is not None else {}
@@ -823,7 +917,7 @@ def wait_order_ready(clore, order_id, logf=log, timeout=ORDER_TIMEOUT, stop=None
             logf(f"[{order_id}] ждём адрес и порты… {acc['host'] or 'ip ещё нет'}")
         else:
             logf(f"[{order_id}] заказ ещё не появился в my_orders")
-        time.sleep(POLL)
+        nap(POLL, stop)
     return None
 
 
@@ -1049,7 +1143,7 @@ def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT, stop=None):
             return "ssh"
         if api_alive(url, key, timeout=5):
             return "API"
-        time.sleep(15)
+        nap(15, stop)
     return None
 
 
@@ -1151,7 +1245,7 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
         if time.time() - last_contact > BLIND_TIMEOUT:
             logf(f"⛔ сервер {BLIND_TIMEOUT // 60} мин не отвечает на опросы о прогрессе")
             return "blind"
-        time.sleep(30)
+        nap(30, stop)
     return "stalled"
 
 
@@ -1310,7 +1404,46 @@ def _unhide_provider(cfg):
     return fixed
 
 
-def _sync_v2_provider(cfg, url, key, title, ctx):
+# Варианты «усилия рассуждений», которые OpenCode предлагает любой OpenAI-совместимой
+# модели сам. Шаблон чата модели может знать другой набор: у Qwen3.8 это low/medium/xhigh,
+# и выбранный в OpenCode «high» llama.cpp отвергал: «reasoning_effort "high" is not
+# supported by the chat template». Поэтому набор берём у самого движка.
+OPENCODE_EFFORTS = ("low", "medium", "high")
+
+
+def reasoning_levels(url, key, timeout=8):
+    """
+    Уровни reasoning_effort, которые принимает шаблон чата модели. llama.cpp отдаёт их в
+    /props (chat_template_caps.reasoning_effort_levels). None — движок не сообщает
+    (vLLM, старый llama.cpp, модель ещё грузится): тогда OpenCode оставляем как есть.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(anthropic_base(url) + "/props",
+                                     headers={"Authorization": f"Bearer {key}"} if key else {})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            caps = json.loads(r.read().decode("utf-8", "replace")).get("chat_template_caps") or {}
+    except Exception:   # noqa — это уточнение, а не условие работы
+        return None
+    if not caps.get("supports_reasoning_effort"):
+        return None
+    levels = [str(x) for x in caps.get("reasoning_effort_levels") or [] if x]
+    if not levels:
+        return None
+    return {"levels": levels,
+            "rejected": [str(x) for x in caps.get("reasoning_effort_rejected") or [] if x]}
+
+
+def _opencode_variants(effort):
+    """Варианты модели для схемы v1: допустимые уровни + отключённые встроенные лишние."""
+    out = {lvl: {"reasoningEffort": lvl} for lvl in effort["levels"]}
+    for lvl in sorted(set(OPENCODE_EFFORTS) | set(effort["rejected"])):
+        if lvl not in out:
+            out[lvl] = {"disabled": True}
+    return out
+
+
+def _sync_v2_provider(cfg, url, key, title, ctx, effort=None):
     """
     Если конфиг уже переехал на схему v2 (ключ `providers`), обновляем и её.
 
@@ -1342,6 +1475,10 @@ def _sync_v2_provider(cfg, url, key, title, ctx):
             "limit": {"context": ctx, "output": max(4096, ctx // 4)},
         }
     }
+    if effort:
+        # в v2 набор вариантов строится из capabilities.reasoning.effort
+        prov["models"][MODEL_NAME]["capabilities"] = {
+            "reasoning": {"supported": True, "effort": effort["levels"]}}
     return True
 
 
@@ -1632,6 +1769,7 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None, origi
     if managed and any(os.path.isfile(os.path.join(managed, n)) for n in _OPENCODE_NAMES):
         logf(f"внимание: есть управляемый конфиг в {managed} — он накладывается поверх "
              f"вашего и может перекрыть провайдера. Правится только с правами админа")
+    effort = reasoning_levels(url, key)
     written, unhidden, v2_synced = [], [], []
     for path in paths:
         cfg = {}
@@ -1662,11 +1800,13 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None, origi
                 "tool_call": True,
             }
         }
+        if effort:
+            prov["models"][MODEL_NAME]["variants"] = _opencode_variants(effort)
         # мало прописать провайдера — надо ещё снять то, что его прячет
         for msg in _unhide_provider(cfg):
             if msg not in unhidden:
                 unhidden.append(msg)
-        if _sync_v2_provider(cfg, url, key, title, ctx):
+        if _sync_v2_provider(cfg, url, key, title, ctx, effort):
             v2_synced.append(path)
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1684,6 +1824,9 @@ def update_opencode(url, key, title=None, logf=log, ctx=None, engine=None, origi
         logf("заодно обновлены другие найденные копии: " + ", ".join(written[1:]))
     for msg in unhidden:
         logf("провайдер был скрыт настройками: " + msg)
+    if effort:
+        logf("уровни рассуждений модели: " + ", ".join(effort["levels"])
+             + " — в OpenCode оставлены только они")
     if v2_synced:
         logf("конфиг на схеме v2 — секция providers обновлена тоже: " + ", ".join(v2_synced))
     logf(f"перезапустите OpenCode: провайдер «{OPENCODE_PROVIDER}», "
@@ -1767,7 +1910,8 @@ def deploy(cfg, env=None, logf=log):
     Возвращает dict с результатом; бросает SystemExit/CloreError при фатальной ошибке.
     """
     env = env or load_env()
-    clore = client(env)
+    stop = cfg.get("stop")
+    clore = client(env, stop)
     api_key = env.get("API_KEY") or ""
     # цены везде в USD; валюта списания выбирается автоматически, если не задана явно
     forced_currency = cfg.get("currency") if cfg.get("currency") in CURRENCIES else None
@@ -1779,12 +1923,13 @@ def deploy(cfg, env=None, logf=log):
     order_type = cfg.get("order_type") or "on-demand"
 
     # уже есть живой заказ?
-    if not cfg.get("force") and env.get("ORDER") and env.get("API_URL"):
+    if not cfg.get("force") and not cfg.get("dry_run") and env.get("ORDER") and env.get("API_URL"):
         if api_alive(env["API_URL"], api_key):
             logf(f"заказ {env['ORDER']} уже работает: {env['API_URL']} (--force чтобы арендовать ещё)")
             return {"status": "already-running", "api_url": env["API_URL"], "order": env["ORDER"]}
     if not cfg.get("dry_run"):
-        _check_leftovers(clore, env, bool(cfg.get("force")), logf)
+        check_stop(stop)
+        patient(lambda: _check_leftovers(clore, env, bool(cfg.get("force")), logf), clore, logf, stop)
         fresh = load_env()       # проверка могла убрать из .env ссылки на погашенные заказы
         env = {**env, **{k: fresh.get(k, "") for k in
                          ("ORDER", "SERVER", "API_URL", "SSH", "RACE_ORDERS", "PENDING_SERVER")}}
@@ -1816,8 +1961,10 @@ def deploy(cfg, env=None, logf=log):
                              "скачаются ни на одном сервере. Впишите токен на вкладке «Настройки»")
         logf("⚠️ репозиторий gated, а HF_TOKEN не задан — скачивание упадёт")
 
-    rates = clore.currency_rates()
-    balances = wallet_balances(clore)
+    # До аренды ничего не оплачивается, поэтому «Стоп» здесь срабатывает сразу
+    check_stop(stop)
+    rates = patient(clore.currency_rates, clore, logf, stop)
+    balances = patient(lambda: wallet_balances(clore), clore, logf, stop)
     bal_usd = sum(amount * rates.get(cur, 0) for cur, amount in balances.items())
     logf("баланс Clore: " + (", ".join(f"{amount:g} {cur}" for cur, amount in balances.items() if amount)
                              or "пусто") + f" (≈ ${bal_usd:.2f})")
@@ -1834,14 +1981,28 @@ def deploy(cfg, env=None, logf=log):
              f"({info['moe']['experts']} экспертов, активны {info['moe']['active']})")
     elif cfg.get("cpu_moe"):
         logf("выгрузка экспертов не применима: нужна MoE-модель в GGUF (движок llama.cpp)")
+    # Фильтры, которые пользователь задал на вкладке «Сервер». Список показывал серверы по
+    # ним, а автоподбор деплоя искал по умолчаниям — и брал не тот сервер, что был первым
+    # в списке, или не находил ни одного. Ниже расчётного требования не опускаем: модель
+    # должна влезть, что бы ни стояло в поле
+    need_disk = info["disk_gb"]
+    if cfg.get("min_vram"):
+        need_vram = max(need_vram, cfg["min_vram"])
+    if cfg.get("min_disk"):
+        need_disk = max(need_disk, cfg["min_disk"])
+    if cfg.get("min_ram"):
+        need_ram = max(need_ram, cfg["min_ram"])
+    min_net = cfg["min_net"] if cfg.get("min_net") is not None else MIN_NET_DOWN_MBPS
 
-    offers = find_offers(clore, need_vram, info["disk_gb"], cfg.get("max_price_usd"),
-                         forced_currency, cfg.get("gpu_filter"), order_type,
-                         download_gib=info["weights_gib"],
-                         engine=info["engine"], quant=info.get("precision"),
-                         allow_old_gpu=bool(cfg.get("allow_old_gpu")),
-                         balance_usd=bal_usd or None, spread=bool(cfg.get("spread")),
-                         need_ram=need_ram, cpu_moe=cpu_moe)
+    offers = patient(lambda: find_offers(
+        clore, need_vram, need_disk, cfg.get("max_price_usd"),
+        forced_currency, cfg.get("gpu_filter"), order_type,
+        min_net=min_net, download_gib=info["weights_gib"],
+        engine=info["engine"], quant=info.get("precision"),
+        allow_old_gpu=bool(cfg.get("allow_old_gpu")),
+        balance_usd=bal_usd or None, spread=bool(cfg.get("spread")),
+        need_ram=need_ram, cpu_moe=cpu_moe), clore, logf, stop)
+    check_stop(stop)
     picked = picked_servers(cfg)
     if picked:
         known = {int(o["id"]): o for o in offers}
@@ -1897,6 +2058,7 @@ def deploy(cfg, env=None, logf=log):
              f"${o['price_used']:.3f}/ч, диск {o['disk_gb']} GB, {o['net_down']:.0f} Mbps")
     if cfg.get("dry_run"):
         return {"status": "dry-run", "model": info, "offers": candidates}
+    check_stop(stop)
 
     script, order_env = render_onstart(info, env, ctx=info["ctx"], gguf_file=cfg.get("gguf_file"))
     command = build_command(script)
@@ -1920,7 +2082,6 @@ def deploy(cfg, env=None, logf=log):
 
     # Заказ могут отменить руками, пока он поднимается. Без этой проверки деплой принимал
     # отменённый сервер за неподнявшийся и молча арендовал следующего кандидата.
-    stop = cfg.get("stop")
     race = bool(cfg.get("race")) and len(candidates) > 1
 
     def plan(offer, lg):
@@ -1974,38 +2135,56 @@ def deploy(cfg, env=None, logf=log):
            f"(списание {p['amount']:g} {p['currency']}/сутки)")
         # Запоминаем, какие заказы на этом сервере уже есть: иначе чужой (или свой прошлый)
         # заказ на том же сервере будет принят за только что созданный
-        try:
-            before = {int(o.get("id", -1)) for o in clore.my_orders()}
-        except CloreError:
+        before = None
+        for _ in range(4):
+            wait_clore(clore, lg, stop)
+            try:
+                before = {int(o.get("id", -1)) for o in clore.my_orders()}
+                break
+            except CloreError as e:
+                if not getattr(e, "not_sent", False):
+                    break
+                lg(f"список заказов не прочитался ({e}) — жду и повторяю")
+        if before is None:
             before = set()
-        # С этого места заказ может существовать и оплачиваться, а его номера у нас ещё
-        # нет. Поэтому сервер помечаем ДО запроса (PENDING_SERVER): что бы ни случилось
-        # дальше — Ctrl+C, закрытое окно, сбой сети, — stop.py найдёт заказ по серверу.
-        track(None, sid)
         http500 = False
-        try:
-            clore.create_order(
-                server_id=sid, image=image, currency=p["currency"], order_type=order_type,
-                ports={22: "tcp", API_PORT: "tcp", STATUS_PORT: "tcp"},
-                env=p["env"], command=command,
-                ssh_password=ssh_password, ssh_key=pubkey,
-                # обычный образ (nvidia/cuda) не содержит sshd и долгоживущего процесса —
-                # без entrypoint Clore контейнер не держится и SSH недоступен
-                autossh_entrypoint=True,
-                spot_price=p["amount"] if order_type == "spot" else None,
-                required_price=p["amount"],
-            )
-            unsure = False
-        except CloreError as e:
-            if getattr(e, "uncertain", False):
-                # Ответ не дошёл, а запрос мог: заказ, возможно, создан и уже
-                # тарифицируется. Не уходим к следующему серверу, а ищем его ниже.
-                lg(f"сервер {sid}: {e} — ответ Clore не получен, проверяю, не создался ли заказ")
-                unsure = True
-                http500 = "HTTP 500" in str(e)
-            else:
-                lg(f"сервер {sid}: {e} — пропускаю")
+        for attempt in range(4):
+            # Clore на паузе (лимит частоты или сбой связи) — ждём её, а не пропускаем
+            # сервер: раньше вся очередь «пропускалась» за одну секунду
+            wait_clore(clore, lg, stop)
+            # С этого места заказ может существовать и оплачиваться, а его номера у нас
+            # ещё нет. Поэтому сервер помечаем ДО запроса (PENDING_SERVER): что бы ни
+            # случилось дальше — Ctrl+C, закрытое окно, сбой сети, — stop.py найдёт заказ.
+            track(None, sid)
+            try:
+                clore.create_order(
+                    server_id=sid, image=image, currency=p["currency"], order_type=order_type,
+                    ports={22: "tcp", API_PORT: "tcp", STATUS_PORT: "tcp"},
+                    env=p["env"], command=command,
+                    ssh_password=ssh_password, ssh_key=pubkey,
+                    # обычный образ (nvidia/cuda) не содержит sshd и долгоживущего процесса —
+                    # без entrypoint Clore контейнер не держится и SSH недоступен
+                    autossh_entrypoint=True,
+                    spot_price=p["amount"] if order_type == "spot" else None,
+                    required_price=p["amount"],
+                )
+                unsure = False
+                break
+            except CloreError as e:
+                if getattr(e, "uncertain", False):
+                    # Ответ не дошёл, а запрос мог: заказ, возможно, создан и уже
+                    # тарифицируется. Не уходим к следующему серверу, а ищем его ниже.
+                    lg(f"сервер {sid}: {e} — ответ Clore не получен, проверяю, не создался ли заказ")
+                    unsure = True
+                    http500 = "HTTP 500" in str(e)
+                    break
                 track(None, None)
+                if getattr(e, "not_sent", False) and attempt < 3:
+                    # запрос точно не выполнен — сервер ни при чём, пробуем его же ещё раз
+                    lg(f"сервер {sid}: Clore просит подождать ({e}) — повторю этот же сервер")
+                    nap(5 * (attempt + 1), stop)
+                    continue
+                lg(f"сервер {sid}: {e} — пропускаю")
                 return None
         polls = 0            # сколько раз список заказов реально прочитался
         for n in range(8):
@@ -2404,7 +2583,7 @@ def _deploy_race(candidates, plan, rent, bring_up, drop, finish, clore, env, inf
                     rows.append(f"{r['sid']}: {r['stage'] or 'старт'} {got:.1f} ГиБ{spd}")
                 if rows:
                     logf("гонка: " + " · ".join(rows))
-            time.sleep(10)
+            nap(10, stop)
     finally:
         # всё, что не победило, — отменяем, что бы ни случилось выше. В том числе заказ,
         # который создавался в момент остановки и номера ещё не получил

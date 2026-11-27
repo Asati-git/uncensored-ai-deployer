@@ -10,21 +10,31 @@ https://clore.ai -> Settings -> API.
 """
 import http.client
 import json
+import os
 import re
 import threading
 import time
 import urllib.error
 import urllib.request
 
-API_BASE = "https://api.clore.ai/v1"
+# CLORE_API_BASE — только для тестов: локальная заглушка вместо настоящего Clore
+API_BASE = os.environ.get("CLORE_API_BASE") or "https://api.clore.ai/v1"
 # валюты списания; в UI всё показывается в USD
 CURRENCIES = ["USD-Blockchain", "bitcoin", "CLORE-Blockchain"]
 RATES_TTL = 600            # как долго держать курсы валют в кэше, секунд
 PRICE_PERIOD_HOURS = 24    # Clore публикует цены за сутки, а не за час
 
 # частота вызовов: path -> минимальный интервал в секундах
-RATE_LIMITS = {"create_order": 5.0}
-DEFAULT_RATE = 1.1
+# Лимит Clore — 1 запрос в секунду НА ТОКЕН, по всем эндпоинтам вместе, и create_order
+# не чаще раза в 5 секунд (docs.clore.ai/guidlines/api). Раньше пауза считалась отдельно
+# для каждого эндпоинта: marketplace, wallets и my_orders уходили в одну и ту же секунду,
+# Clore отвечал HTTP 429, и деплой пропускал все серверы очереди. Теперь между ЛЮБЫМИ
+# двумя запросами к Clore — не меньше GLOBAL_GAP, с запасом против лимита. Пауза общая
+# и для разных процессов (UI, stop.py, второе окно UI): время последнего запроса лежит
+# в файле во временном каталоге.
+GLOBAL_GAP = 1.6
+RATE_LIMITS = {"create_order": 6.0}
+DEFAULT_RATE = GLOBAL_GAP
 # Запросы, которые нельзя повторять вслепую. Если create_order дошёл до Clore, а ответ
 # потерялся, повтор получит «сервер уже арендован» — нами же: деплой уйдёт к следующему
 # серверу, а первый заказ останется тарифицироваться без единой ссылки на него.
@@ -51,8 +61,11 @@ _DETAILS = {
 
 
 class CloreError(RuntimeError):
-    def __init__(self, code, detail=None, uncertain=False):
+    def __init__(self, code, detail=None, uncertain=False, not_sent=False):
         self.code = code
+        # True — запрос точно не выполнен (пауза после сбоя, лимит частоты): его можно
+        # повторить позже, и сервер из-за этого пропускать не нужно
+        self.not_sent = not_sent or code == 5
         self.detail = detail
         # True — неизвестно, выполнился ли запрос: ответ не дошёл. Для create_order это
         # значит, что заказ мог создаться, и вызывающий обязан проверить это сам.
@@ -63,27 +76,230 @@ class CloreError(RuntimeError):
         super().__init__(f"Clore API: {msg}")
 
 
+# Состояние, общее для всех клиентов с одним ключом. UI создаёт новый Clore на каждый
+# HTTP-запрос, и раньше у каждого были свои паузы и свой кэш курсов: параллельные
+# запросы страницы (кошельки, заказы, подбор) били в Clore одновременно, ловили
+# code 5 и уходили в повторы — «Найти» висело по минуте без единого слова.
+_SHARED = {}
+_SHARED_LOCK = threading.Lock()
+
+# Clore стоит за Cloudflare. Если с IP идёт слишком много запросов, Cloudflare блокирует
+# его целиком — вместе с сайтом — на минуты: соединение рвётся или висит до таймаута,
+# либо приходит HTTP 403/429. Раньше клиент отвечал на это пятью повторами каждого
+# запроса, а деплой и UI делали такие запросы по нескольку подряд — блокировка только
+# продлевалась, а кнопки висели минутами. Теперь после такого сбоя Clore считается
+# недоступным BLOCK_COOLDOWN секунд, и все запросы (кроме отмены заказа) сразу отвечают
+# понятной ошибкой, не трогая сеть.
+BLOCK_COOLDOWN = 90
+# Маркетплейс весит несколько мегабайт. Его спрашивают и подбор серверов, и вкладки
+# «Заказы»/«Кошельки», и деплой — кэш убирает повторные скачивания подряд. UI держит
+# его тёплым (app.py подгружает список при запуске и раз в пару минут, пока UI открыт),
+# поэтому «Найти серверы» отвечает сразу, а не через 15–20 с скачивания. Две минуты —
+# не страшно и для деплоя: сервер, который успели занять, create_order просто не отдаст,
+# и деплой возьмёт следующий из очереди.
+MARKET_TTL = 120
+# Пути, ожидание которых можно оборвать кнопкой «Стоп»: это чтение, повторить его потом
+# безопасно. my_orders и cancel_order сюда не входят — на них держатся поиск только что
+# созданного заказа и его отмена, обрывать их нельзя.
+INTERRUPTIBLE = {"marketplace", "wallets", "spot_marketplace"}
+# Отмену заказа пробуем всегда, даже когда Clore считается недоступным: это деньги
+ALWAYS_TRY = {"cancel_order"}
+
+
+class _SlotFile:
+    """
+    Время последних запросов к Clore, общее для всех процессов на этом ПК с этим ключом.
+    Файл блокируется на время «дождаться очереди и записать время», так что два окна UI
+    или UI и stop.py не отправят запросы в одну секунду. Если файл недоступен (нет прав,
+    странная ФС) — работаем по памяти процесса, как раньше: это хуже, но не ломает.
+    """
+    _mem = {}
+
+    def __init__(self, api_key):
+        import hashlib
+        import tempfile
+        tag = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+        self.path = os.path.join(tempfile.gettempdir(), f"uncensoredai-clore-{tag}.json")
+        self.key = tag
+        self.f = None
+
+    def __enter__(self):
+        try:
+            # не "a": в режиме дозаписи seek(0) не помогает, всё уходит в конец файла
+            self.f = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600), "r+b")
+            t0 = time.time()
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        self.f.seek(0)
+                        msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.time() - t0 > 30:   # чужой процесс завис с файлом — не ждём вечно
+                        raise
+                    time.sleep(0.05)
+        except OSError:
+            if self.f:
+                self.f.close()
+            self.f = None
+        return self
+
+    def read(self):
+        if not self.f:
+            return dict(self._mem.get(self.key) or {})
+        try:
+            self.f.seek(0)
+            data = json.loads(self.f.read().decode() or "{}")
+            return {k: float(v) for k, v in data.items()}
+        except (ValueError, OSError, AttributeError):
+            return {}
+
+    def write(self, data):
+        self._mem[self.key] = dict(data)
+        if not self.f:
+            return
+        try:
+            # Блокировка msvcrt стоит на первом байте — файл не обрезаем, а переписываем
+            # содержимое с начала и добиваем пробелами: JSON их допускает
+            body = json.dumps(data).encode()
+            self.f.seek(0, os.SEEK_END)
+            size = self.f.tell()
+            self.f.seek(0)
+            self.f.write(body + b" " * max(0, size - len(body)))
+            self.f.flush()
+        except OSError:
+            pass
+
+    def __exit__(self, *exc):
+        if self.f:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self.f.close()
+        return False
+
+
+class Stopped(Exception):
+    """Ожидание ответа Clore прервано снаружи (кнопка «Стоп»)."""
+
+
+def _shared(api_key):
+    with _SHARED_LOCK:
+        return _SHARED.setdefault(api_key, {
+            "lock": threading.Lock(), "last": {}, "rates": None,
+            "market": None, "market_lock": threading.Lock(),
+            "down_until": 0.0, "down_why": ""})
+
+
+def blocked_for(api_key):
+    """Сколько секунд ещё считаем Clore недоступным (0 — доступен)."""
+    st = _shared((api_key or "").strip())
+    return max(0, int(st["down_until"] - time.time()))
+
+
 class Clore:
-    def __init__(self, api_key, base=API_BASE, timeout=30):
+    def __init__(self, api_key, base=API_BASE, timeout=20, stop=None, stop_exc=Stopped):
         if not api_key:
             raise CloreError(2, "ключ не задан")
         self.api_key = api_key.strip()
         self.base = base.rstrip("/")
         self.timeout = timeout
-        self._lock = threading.Lock()
-        self._last = {}
-        self._rates = None  # (время, {валюта: курс в USD})
+        # stop — функция без аргументов; истина означает «пользователь нажал Стоп».
+        # Тогда ожидание на путях из INTERRUPTIBLE обрывается исключением stop_exc
+        self.stop = stop
+        self.stop_exc = stop_exc
+        self._state = _shared(self.api_key)
+        self._lock = self._state["lock"]
+        self._last = self._state["last"]
+
+    @property
+    def _rates(self):  # (время, {валюта: курс в USD}) — общий для всех экземпляров
+        return self._state["rates"]
+
+    @_rates.setter
+    def _rates(self, value):
+        self._state["rates"] = value
 
     # ---------- транспорт ----------
+    def _check_stop(self, path):
+        if self.stop and path in INTERRUPTIBLE and self.stop():
+            raise self.stop_exc("деплой остановлен")
+
+    def _sleep(self, sec, path):
+        """Пауза между повторами, которую обрывает «Стоп» — на безопасных для этого путях."""
+        end = time.time() + sec
+        while True:
+            self._check_stop(path)
+            left = end - time.time()
+            if left <= 0:
+                return
+            time.sleep(min(left, 0.25))
+
+    def _fetch(self, req, path):
+        """
+        Сам HTTP-запрос. Для чтения, которое можно бросить (INTERRUPTIBLE), он идёт в
+        отдельном потоке, а мы ждём его, поглядывая на «Стоп»: при блокировке IP
+        соединение висит до таймаута, и кнопка иначе ждала бы его целиком.
+        """
+        def go():
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode())
+        if not (self.stop and path in INTERRUPTIBLE):
+            return go()
+        box = {}
+
+        def worker():
+            try:
+                box["out"] = go()
+            except BaseException as e:  # noqa — передаём в вызывающий поток как есть
+                box["err"] = e
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+        while th.is_alive():
+            th.join(0.25)
+            self._check_stop(path)
+        if "err" in box:
+            raise box["err"]
+        return box["out"]
+
     def _throttle(self, path):
-        gap = RATE_LIMITS.get(path, DEFAULT_RATE)
-        with self._lock:
-            wait = gap - (time.time() - self._last.get(path, 0))
+        """Ждёт своей очереди: не чаще GLOBAL_GAP на любой запрос и RATE_LIMITS на путь."""
+        with self._lock, _SlotFile(self.api_key) as slot:
+            last = slot.read()
+            now = time.time()
+            wait = max(GLOBAL_GAP - (now - last.get("*", 0)),
+                       RATE_LIMITS.get(path, 0) - (now - last.get(path, 0)), 0)
             if wait > 0:
                 time.sleep(wait)
-            self._last[path] = time.time()
+            now = time.time()
+            last["*"] = now
+            if path in RATE_LIMITS:
+                last[path] = now
+            slot.write(last)
 
-    def _call(self, path, body=None, query=None, retries=5):
+    def _mark_down(self, why):
+        self._state["down_until"] = time.time() + BLOCK_COOLDOWN
+        self._state["down_why"] = why
+
+    def _down_error(self):
+        left = int(self._state["down_until"] - time.time())
+        return CloreError(1, f"Clore.ai не отвечает ({self._state['down_why']}). Похоже на "
+                             f"временную блокировку IP за частые запросы — не нажимайте кнопки "
+                             f"повторно, следующая попытка не раньше чем через {max(left, 1)} с",
+                          not_sent=True)
+
+    def _call(self, path, body=None, query=None, retries=4):
         url = f"{self.base}/{path}"
         if query:
             url += "?" + "&".join(f"{k}={v}" for k, v in query.items())
@@ -93,23 +309,43 @@ class Clore:
             headers["Content-Type"] = "application/json"
 
         safe = path not in NON_IDEMPOTENT
+        net_fails = 0
         for attempt in range(retries):
+            if path not in ALWAYS_TRY and time.time() < self._state["down_until"]:
+                raise self._down_error()
+            self._check_stop(path)
             self._throttle(path)
             req = urllib.request.Request(url, data=data, headers=headers,
                                          method="POST" if data else "GET")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    out = json.loads(resp.read().decode())
+                out = self._fetch(req, path)
             except urllib.error.HTTPError as e:
                 payload = e.read().decode(errors="replace")[:300]
                 # любой 5xx не говорит, выполнился ли запрос на стороне Clore
                 gateway = e.code >= 500
-                # 429 — запрос отвергнут, повторять можно всегда. Ошибка шлюза не говорит,
-                # дошёл ли запрос до бэкенда, поэтому create_order на ней не повторяем
-                if (e.code == 429 or (e.code in (502, 503, 504) and safe)) and attempt < retries - 1:
-                    # 429 прилетает, когда к аккаунту обращаются сразу несколько деплоев;
-                    # пауза по секунде тут не помогает — ждём ощутимо дольше
-                    time.sleep((5 if e.code == 429 else 1) * (2 ** attempt))
+                if e.code == 429:
+                    # Лимит частоты: запрос отвергнут и не выполнен, повторять можно даже
+                    # create_order. Ждём, сколько просит Clore (Retry-After), иначе с запасом.
+                    # Это не блокировка IP — общую паузу не включаем
+                    if attempt < retries - 1:
+                        try:
+                            pause = float(e.headers.get("Retry-After") or 0)
+                        except (TypeError, ValueError):
+                            pause = 0
+                        self._sleep(max(pause, 3 * (attempt + 1)), path)
+                        continue
+                    raise CloreError(5, "HTTP 429 — Clore просит реже; попробуйте через минуту")
+                if e.code == 403:
+                    # 403 от Cloudflare перед Clore — это уже блокировка: повтор её продлевает
+                    self._mark_down("HTTP 403")
+                    if path in ALWAYS_TRY and attempt < retries - 1:
+                        self._sleep(5 * (attempt + 1), path)
+                        continue
+                    raise self._down_error()
+                # Ошибка шлюза не говорит, дошёл ли запрос до бэкенда, поэтому create_order
+                # на ней не повторяем
+                if e.code in (502, 503, 504) and safe and attempt < retries - 1:
+                    self._sleep(2 ** attempt, path)
                     continue
                 raise CloreError(1, f"HTTP {e.code}: {payload}", uncertain=gateway and not safe)
             except (OSError, http.client.HTTPException, ValueError) as e:
@@ -117,19 +353,31 @@ class Clore:
                 # соединения на чтении ответа, оборванное тело, HTML вместо JSON. Раньше
                 # такие ошибки летели мимо CloreError — и деплой падал, не записав номер
                 # только что созданного заказа, а отмена обрывалась на полпути.
-                if safe and attempt < retries - 1:
-                    time.sleep(2 ** attempt)
+                net_fails += 1
+                # Разовый сбой повторяем. Два подряд — уже не случайность, а блокировка
+                # или лёг сам Clore: дальше не долбим и выдерживаем паузу для всех.
+                # Отмену заказа пробуем до конца — от неё зависят деньги
+                if safe and attempt < retries - 1 and (net_fails < 2 or path in ALWAYS_TRY):
+                    self._sleep(2 * net_fails, path)
                     continue
-                raise CloreError(1, f"сеть: {e.__class__.__name__}: {e}", uncertain=not safe)
+                if not safe:
+                    # create_order: один сбой не повод глушить остальные запросы — сразу
+                    # после него деплой ищет, не создался ли заказ, через my_orders
+                    raise CloreError(1, f"сеть: {e.__class__.__name__}: {e}", uncertain=True)
+                self._mark_down(f"{e.__class__.__name__}: {e}"[:120])
+                raise self._down_error()
             if not isinstance(out, dict):
                 if safe and attempt < retries - 1:
-                    time.sleep(2 ** attempt)
+                    self._sleep(2 ** attempt, path)
                     continue
                 raise CloreError(1, "ответ Clore не разобрать", uncertain=not safe)
 
+            # ответ пришёл — значит, Clore доступен
+            self._state["down_until"] = 0.0
             code = out.get("code", 0)
             if code == 5 and attempt < retries - 1:
-                time.sleep(RATE_LIMITS.get(path, DEFAULT_RATE) * (attempt + 2))
+                # тот же лимит, сказанный в теле ответа: запрос не выполнен, повтор безопасен
+                self._sleep(max(RATE_LIMITS.get(path, 0), GLOBAL_GAP) * (attempt + 2), path)
                 continue
             if code:
                 raise CloreError(code, out.get("error") or out.get("field"))
@@ -140,9 +388,27 @@ class Clore:
     def wallets(self):
         return self._call("wallets").get("wallets", [])
 
-    def marketplace(self):
-        out = self._call("marketplace")
-        return out.get("servers", [])
+    def marketplace(self, fresh=False):
+        """
+        Список серверов. Кэшируется на MARKET_TTL секунд для всех клиентов с этим ключом:
+        параллельные запросы UI ждут одну загрузку, а не качают мегабайты каждый.
+        fresh=True — обязательно свежий.
+        """
+        st = self._state
+        with st["market_lock"]:
+            cached = st["market"]
+            if not fresh and cached and time.time() - cached[0] < MARKET_TTL:
+                return list(cached[1])
+            if fresh == "if-old" and cached and time.time() - cached[0] < MARKET_TTL - 30:
+                return list(cached[1])   # подогрев: другой поток уже успел обновить
+            servers = self._call("marketplace").get("servers", [])
+            st["market"] = (time.time(), servers)
+            return list(servers)
+
+    def market_age(self):
+        """Сколько секунд назад скачан маркетплейс (None — ещё ни разу)."""
+        cached = self._state["market"]
+        return time.time() - cached[0] if cached else None
 
     def my_orders(self, completed=False):
         q = {"return_completed": "true"} if completed else None
@@ -182,29 +448,25 @@ class Clore:
     def currency_rates(self, servers=None):
         """
         Курсы валют Clore в USD ({'bitcoin': 98000.0, 'CLORE-Blockchain': 0.03}).
-        Источник — поле currency_rates_in_usd эндпоинта spot_marketplace; если он недоступен,
-        курс выводится из серверов, у которых Clore сам отдал цену и в USD, и в монете.
+        Выводятся из маркетплейса: у многих серверов Clore сам отдаёт цену и в USD, и в
+        монете. spot_marketplace без server_id отвечает пустым market, а раньше его
+        спрашивали при каждом нажатии — теперь он только запасной источник.
+        Ошибка сети пробрасывается: нулевые курсы показали бы нулевой баланс.
         """
         now = time.time()
         if self._rates and now - self._rates[0] < RATES_TTL:
             return self._rates[1]
-        rates = {}
-        try:
-            data = self.spot_marketplace()
-            raw = (data.get("market") or data).get("currency_rates_in_usd") or {}
-            rates = {k: float(v) for k, v in raw.items() if is_price(v)}
-        except (CloreError, AttributeError, TypeError, ValueError):
-            rates = {}
+        rates = _rates_from_servers(servers if servers is not None else self.marketplace())
         if not rates:
-            rates = _rates_from_servers(servers if servers is not None else self._safe_marketplace())
-        self._rates = (now, rates)
+            try:
+                data = self.spot_marketplace()
+                raw = (data.get("market") or data).get("currency_rates_in_usd") or {}
+                rates = {k: float(v) for k, v in raw.items() if is_price(v)}
+            except (AttributeError, TypeError, ValueError):
+                rates = {}
+        if rates:   # пустое не кэшируем: иначе баланс десять минут показывался бы нулём
+            self._rates = (now, rates)
         return rates
-
-    def _safe_marketplace(self):
-        try:
-            return self.marketplace()
-        except CloreError:
-            return []
 
     def cancel_order(self, order_id, issue=None):
         body = {"id": int(order_id)}
