@@ -167,7 +167,16 @@ git_clone_retry() {
   local url="$1" dst="$2" i
   for i in 1 2 3 4 5; do
     rm -rf "$dst"
-    if git clone --depth 1 "$url" "$dst"; then
+    # У git нет своего таймаута: на хосте с плохим путём до GitHub клон висел на
+    # «Cloning into...» больше десяти минут, и сервер со скачанными весами отменялся
+    # по застою. Обрываем медленное соединение (<1 КБ/с минуту) и весь клон за 5 мин.
+    if timeout 300 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60         clone --depth 1 "$url" "$dst"; then
+      return 0
+    fi
+    # запасной путь — архив ветки по HTTPS: другой сервер GitHub (codeload)
+    rm -rf "$dst"; mkdir -p "$dst"
+    if timeout 300 curl -fsSL --speed-limit 1000 --speed-time 60         "${url%.git}/archive/HEAD.tar.gz" | tar -xz -C "$dst" --strip-components=1         && [ -f "$dst/CMakeLists.txt" ]; then
+      echo "[setup] git clone не удался, взял архив исходников"
       return 0
     fi
     echo "[setup] клон $url не удался, попытка $i/5"

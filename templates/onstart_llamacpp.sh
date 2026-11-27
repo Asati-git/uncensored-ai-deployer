@@ -43,7 +43,9 @@ if [ ! -f /root/.setup_done ]; then
     else
       hf_download "${MODEL_REPO}" --local-dir "${MODEL_DIR}" >> /root/download.log 2>&1
     fi
-    touch /root/.download_done ) &
+    touch /root/.download_done
+    # веса на месте, а движок ещё собирается — пусть это будет видно, а не «100%»
+    [ -f /root/.build_done ] || [ "$(cat /root/.stage 2>/dev/null)" != download ] || stage build ) &
   DLPID=$!
 
   # onstart выполняется не из login-шелла, поэтому /usr/local/cuda/bin в PATH не попадает
@@ -71,6 +73,7 @@ if [ ! -f /root/.setup_done ]; then
     || { echo "[setup] ОШИБКА: cmake не сконфигурировал сборку"; exit 1; }
   cmake --build /root/llama.cpp/build --config Release -j"$(nproc)" --target llama-server \
     || { echo "[setup] ОШИБКА: llama-server не собрался"; exit 1; }
+  touch /root/.build_done
   wait $DLPID
   [ -f /root/.download_done ] || { echo "[setup] ОШИБКА: веса не скачались, движок не запускаю"; exit 1; }
   touch /root/.setup_done
@@ -104,6 +107,17 @@ if [ -n "${N_CPU_MOE}" ] && [ "${N_CPU_MOE}" -gt 0 ] 2>/dev/null; then
   echo "[setup] эксперты первых ${N_CPU_MOE} слоёв остаются в оперативке"
 fi
 
+# Сколько слоёв держать на картах. Раньше всегда было -ngl 999 — и оно отключало
+# встроенный подбор llama.cpp (--fit): на 8× RTX PRO 5000 веса GLM-5.3 Q8 влезли, а
+# буферам вычислений (4 ГиБ на карту) места не хватило, и движок упал. Без -ngl он
+# сам раскладывает слои с учётом буферов и кэша, а при нехватке переносит часть
+# экспертов в RAM: медленнее, но модель поднимается. С явной выгрузкой экспертов
+# подбор всё равно не работает, там остаётся -ngl 999.
+NGL_ARG=""
+if [ -n "${MOE_ARG}" ] || ! /root/llama.cpp/build/bin/llama-server --help 2>&1 | grep -q -- "--fit"; then
+  NGL_ARG="-ngl 999"
+fi
+
 stage engine
 echo "[setup] запускаю модель из ${GGUF}"
 { set +x; } 2>/dev/null   # дальше без трассировки: в команде ключ API
@@ -112,7 +126,7 @@ setsid nohup /root/llama.cpp/build/bin/llama-server \
   --alias "${MODEL_NAME}" \
   --host 0.0.0.0 --port "${PORT}" \
   --api-key "${API_KEY}" \
-  -c "${CTX}" -ngl 999 --split-mode layer \
+  -c "${CTX}" ${NGL_ARG} --split-mode layer \
   ${MOE_ARG} \
   --parallel 1 --metrics \
   --flash-attn on --jinja \
@@ -126,7 +140,12 @@ set -x
     curl -fs -o /dev/null "http://127.0.0.1:${PORT}/health" && exit 0
     if ! pgrep -f /root/llama.cpp/build/bin/llama-server >/dev/null; then
       sleep 2
-      why=$(grep -a -E ' E |error' /root/engine.log | tail -n 3 | tr '\n' ' ' | cut -c1-260)
+      if grep -a -q -E 'out of memory|failed to allocate' /root/engine.log; then
+        # последние строки тут — общее «failed to create context», суть выше
+        why="не хватило видеопамяти: $(grep -a -E 'out of memory|failed to allocate' /root/engine.log | head -n 1 | cut -c1-200)"
+      else
+        why=$(grep -a -E ' E |error' /root/engine.log | tail -n 3 | tr '\n' ' ' | cut -c1-260)
+      fi
       echo "ОШИБКА: движок не запустился: ${why}" | tee -a /root/deploy.log > /root/.fail
       stage failed
       exit 0

@@ -643,18 +643,23 @@ def bench(url, key, model=MODEL_NAME):
 # и FP8, а vLLM с версии V1 требует Ampere и новее — такой заказ просто не поднимется.
 # Сопоставляем название карты с архитектурой и её compute capability.
 GPU_ARCH = [
-    (r"blackwell|\bb[12]00\b|gb\d{3}|rtx\s*50\d0|5090|5080|5070", "Blackwell", 10.0),
+    # Quadro RTX 4000/5000/6000/8000 — Turing, хоть номер и как у новых RTX 4000/5000;
+    # «RTX 5000Ada» (так пишет площадка, слитно) — Ada, а не Blackwell
+    (r"(quadro|\bq)\s*rtx\s*[4-8]000\b(?!\s*ada)", "Turing", 7.5),
+    (r"\d{4}\s*ada\b|\bada\b", "Ada", 8.9),
+    (r"blackwell|\bb[123]00\b|gb\d{3}|rtx\s*50\d0|5090|5080|5070|5060|6000\s*d\b", "Blackwell", 10.0),
     (r"h100|h200|h800|gh200", "Hopper", 9.0),
     (r"\bada\b|rtx\s*40\d0|4090|4080|4070|\bl40s?\b|\bl4\b", "Ada", 8.9),
     (r"a100|a800|cmp\s*170hx", "Ampere", 8.0),
-    (r"\ba(?:2|10|16|30|40)\b|rtx\s*30\d0|3090|3080|3070|3060|"
-     r"a6000|a5000|a4500|a4000|a2000", "Ampere", 8.6),
-    # CMP HX и GTX 16xx — тот же Turing, просто без видеовыхода или урезанные
+    # CMP 70HX/90HX — это GA104/GA102, то есть Ampere; 30–50HX — Turing
+    (r"\ba(?:2|10|16|30x?|40)\b|rtx\s*30\d0|3090|3080|3070|3060|3050|"
+     r"a6000|a5500|a5000|a4500|a4000|a2000|cmp\s*(?:70|90)hx", "Ampere", 8.6),
     (r"rtx\s*20\d0|2080|2070|2060|\bt4\b|titan\s*rtx|quadro\s*rtx|"
-     r"gtx\s*16\d0|cmp\s*(?:30|40|50|70|90)hx", "Turing", 7.5),
-    (r"v100|titan\s*v", "Volta", 7.0),
-    (r"p100|\bp40\b|\bp4\b|g[tx]{1,2}\s*10\d0|1080|1070|1060|p10[246][-_ ]?100", "Pascal", 6.1),
-    (r"\bm40\b|\bm60\b|gtx\s*9\d0|tesla\s*m\d", "Maxwell", 5.2),
+     r"gtx\s*16\d0|cmp\s*(?:30|40|50)hx", "Turing", 7.5),
+    (r"v100|titan\s*v|pg500|cmp\s*100[-_ ]?210", "Volta", 7.0),
+    (r"p100(?!\d)|\bp40\b|\bp4\b|g[tx]{1,2}\s*10\d0|1080|1070|1060|1050|p10[246][-_ ]?100|"
+     r"quadro\s*p\d", "Pascal", 6.1),
+    (r"\bm40\b|\bm60\b|gtx\s*9\d0|gtx\s*7[45]\d|tesla\s*m\d|quadro\s*[km]\d", "Maxwell", 5.2),
 ]
 # Минимальная compute capability под движок и формат весов.
 MIN_CC_ENGINE = {
@@ -684,33 +689,56 @@ RECOMMENDED_CC = 8.0
 # чем RTX 3070 (0.45 ТБ/с), даже если у неё меньше памяти. Пропускная способность одной
 # карты, ГБ/с, — по паспортным данным; площадка может сообщить её сама (mem_bw).
 GPU_BW = [
+    # Порядок важен: берётся первое совпадение. Поэтому ноутбучные версии (у них шина
+    # уже) и Quadro RTX (номера как у новых RTX 4000/5000) идут раньше обычных карт.
+    (r"(5090|5080).*laptop", 896), (r"5070\s*ti.*laptop", 448), (r"50[67]0.*laptop", 384),
+    (r"4090.*laptop", 576), (r"4080.*laptop", 432), (r"40[67]0.*laptop", 256),
+    (r"3080\s*ti.*laptop", 512), (r"3080.*laptop", 448), (r"3070\s*ti.*laptop", 448),
+    (r"3070.*laptop", 384), (r"3060.*laptop", 336), (r"a5500.*laptop", 448),
+    (r"(quadro|\bq)\s*rtx\s*4000\b(?!\s*ada)", 416), (r"(quadro|\bq)\s*rtx\s*5000\b(?!\s*ada)", 448),
+    (r"titan\s*rtx|(quadro|\bq)\s*rtx\s*[68]000\b(?!\s*ada)", 672),
     # Blackwell
-    (r"\bb[12]00\b|gb[23]00", 8000), (r"\bgb10\b", 273),
+    (r"\bb[123]00\b|gb[23]00", 8000), (r"\bgb10\b", 273),
+    # китайская RTX 6000D: паспорта нет, по замерам хостов ~1.22 ТБ/с (÷0.86)
+    (r"rtx\s*(pro\s*)?6000\s*d\b", 1420),
     (r"rtx\s*pro\s*6000", 1792), (r"rtx\s*pro\s*5000", 1344), (r"rtx\s*pro\s*4500", 896),
-    (r"rtx\s*pro\s*4000", 672), (r"5090", 1792), (r"5080", 960), (r"5070\s*ti", 896),
-    (r"5070", 672), (r"5060", 448),
+    (r"rtx\s*pro\s*4000", 672), (r"rtx\s*pro\s*2000", 288),
+    (r"5090", 1792), (r"5080", 960), (r"5070\s*ti", 896), (r"5070", 672), (r"5060", 448),
     # Hopper
     (r"h200", 4800), (r"gh200", 4000), (r"h100.*nvl", 3900), (r"h100.*pcie", 2000), (r"h100|h800", 3350),
     # Ada
     (r"(rtx\s*)?6000\s*ada|5880\s*ada", 960), (r"5000\s*ada", 576), (r"4500\s*ada", 432),
     (r"4000\s*ada", 360), (r"2000\s*ada", 224), (r"\bl40s?\b", 864), (r"\bl4\b", 300),
-    (r"4090", 1008), (r"4080", 717), (r"4070\s*ti\s*super", 672), (r"4070", 504),
+    (r"4090", 1008), (r"4080\s*s(uper)?\b", 736), (r"4080", 717),
+    (r"4070\s*(ti\s*s(uper)?|s(uper)?\s*ti)\b", 672), (r"4070", 504),
     (r"4060\s*ti", 288), (r"4060", 272),
-    # Ampere
-    (r"a100.*(80|sxm)|a800", 2039), (r"a100", 1555), (r"\ba40\b", 696), (r"\ba30\b", 933),
-    (r"\ba10\b", 600), (r"\ba16\b", 200), (r"a6000", 768), (r"a5000", 768), (r"a4500", 640),
-    (r"a4000", 448), (r"a2000", 288), (r"cmp\s*170hx", 1493),
+    # Ampere. A100 SXM без размера на площадках — обычно 80 ГБ; 40 ГБ — 1555 ГБ/с
+    (r"a100(?!.*40\s*gb).*(80|sxm)|a800", 2039), (r"a100", 1555), (r"\ba40\b", 696),
+    (r"\ba30x\b", 1223), (r"\ba30\b", 933), (r"\ba10\b", 600), (r"\ba16\b", 200), (r"\ba2\b", 200),
+    (r"a6000", 768), (r"a5500", 768), (r"a5000", 768), (r"a4500", 640), (r"a4000", 448),
+    (r"a2000", 288),
+    # майнинговые CMP: память как у игровых собратьев, вычисления урезаны
+    (r"cmp\s*170hx", 1493), (r"cmp\s*90hx", 760), (r"cmp\s*70hx", 608), (r"cmp\s*50hx", 560),
+    (r"cmp\s*40hx", 448), (r"cmp\s*30hx", 336), (r"cmp\s*100[-_ ]?210", 830),
     (r"3090\s*ti", 1008), (r"3090", 936), (r"3080\s*ti", 912), (r"3080", 760),
-    (r"3070\s*ti", 608), (r"3070|3060\s*ti", 448), (r"3060", 360),
-    # Turing и старше
-    (r"titan\s*rtx|(quadro|q)\s*rtx\s*[68]000", 672), (r"2080\s*ti", 616), (r"2080", 448),
-    (r"2070|2060\s*super", 448), (r"2060", 336), (r"\bt4\b", 320),
-    (r"1660\s*(ti|s)", 336), (r"1660", 192), (r"v100", 900), (r"titan\s*v", 653),
-    (r"p100", 732), (r"\bp40\b", 347), (r"1080\s*ti", 484), (r"1080", 320), (r"1070", 256),
-    (r"1060|\bp4\b", 192),
+    (r"3070\s*ti", 608), (r"3070|3060\s*ti", 448), (r"3060", 360), (r"3050", 224),
+    # Turing
+    (r"2080\s*ti", 616), (r"2080\s*s(uper)?\b", 496), (r"2080", 448),
+    (r"2070|2060\s*s(uper)?\b", 448), (r"2060", 336), (r"\bt4\b", 320),
+    (r"1660\s*s(uper)?\b", 336), (r"1660\s*ti", 288), (r"1660", 192),
+    # Volta (PG500-216 — серверная V100 SXM2 32 ГБ под другим именем)
+    (r"v100|pg500", 900), (r"titan\s*v", 653),
+    # Pascal: P1000/P2200 — не P100, поэтому P100 только без следующей цифры
+    (r"p100(?!\d)", 732), (r"\bp40\b", 347), (r"p102[-_ ]?100", 440), (r"p104[-_ ]?100", 320),
+    (r"p106[-_ ]?100", 192), (r"quadro\s*p6000", 432), (r"quadro\s*p5000", 288),
+    (r"quadro\s*p4000", 243), (r"quadro\s*p2[02]00", 200), (r"quadro\s*p1000", 82),
+    (r"1080\s*ti", 484), (r"1080", 320), (r"1070", 256), (r"1060|\bp4\b", 192), (r"1050", 112),
+    # Maxwell
+    (r"\bm40\b", 288), (r"\bm60\b", 160), (r"k1200", 80), (r"gtx\s*745", 29),
 ]
-TPS_EFF = 0.9            # доля паспортной пропускной способности, которую выжимает движок
-TPS_OVERHEAD = 0.002     # постоянные расходы на токен, с — заметны только у малых моделей
+TPS_EFF = 0.87           # доля паспортной пропускной способности, которую выжимает движок
+TPS_OVERHEAD = 0.0012    # постоянные расходы на токен, с — заметны только у малых моделей
+TPS_OVERHEAD_DC = 0.002  # у серверных карт на HBM (A100/H100/B200) расходы на токен выше
 RAM_CHANNEL_GBS = 25.6   # один канал DDR4-3200, ГБ/с
 RAM_EFF = 0.45           # доля, которую реально выжимает llama.cpp на экспертах в RAM
 # Откалибровано по живым замерам: 4× RTX 5080 + Qwen3.8-27B Q8 — 30 ток/с (оценка 28);
@@ -734,6 +762,27 @@ def gpu_bandwidth(name):
 # откалиброван TPS_EFF) и не даём единичному кривому замеру уронить карту ниже половины
 # паспорта или поднять выше него.
 MEASURED_TO_SPEC = 0.86
+# доля от TPS_EFF, которую движок выжимает на старых архитектурах (см. estimate_tps)
+# Множители к TPS_EFF по публичному рейтингу llama.cpp (discussion #15013: llama-bench,
+# 7B Q4_0, tg128, около 45 карт). Сначала исключения по имени, потом по архитектуре.
+# Майнинговые CMP упираются не в память, а в урезанные вычисления: CMP 170HX без
+# доработок даёт 65 ток/с при 1.5 ТБ/с, перешитые на 40–64 ГБ — около 145.
+TPS_CARD_FACTOR = [
+    (r"cmp\s*170hx", 0.4), (r"cmp\s*100", 0.6), (r"\bcmp\b", 0.5),
+    (r"p100(?!\d)", 0.4), (r"\bt4\b", 0.7), (r"laptop", 0.85),
+    (r"a100|a800|\ba30x?\b", 0.8),
+]
+ARCH_TPS_FACTOR = {"Turing": 0.88, "Volta": 0.72, "Pascal": 0.7, "Maxwell": 0.55}
+DC_HBM = r"a100|a800|\ba30x?\b|h100|h200|h800|gh200|\bb[123]00\b|gb[23]00"
+
+
+def card_tps_factor(name):
+    low = (name or "").lower()
+    for pat, f in TPS_CARD_FACTOR:
+        if re.search(pat, low):
+            return f
+    return ARCH_TPS_FACTOR.get(gpu_arch(name)[0], 1.0)
+TPS_HOP = 0.00015        # с на каждый переход между картами при делении по слоям
 
 
 def _card_bw(spec, measured):
@@ -764,7 +813,14 @@ def estimate_tps(brief, read_gpu_gib, read_ram_gib=0.0, engine=None):
         # llama.cpp делит модель по слоям: карты работают по очереди, и токен проходит
         # их все — скорость как у одной карты (самой медленной)
         bw = min(bws)
-    t = read_gpu_gib * 1.0737 / (bw * TPS_EFF) + TPS_OVERHEAD
+    # Старые архитектуры не выжимают свою пропускную способность: ядра llama.cpp
+    # оптимизируют под Ampere и новее. По рейтингу llama.cpp (7B Q4_0): V100 — 129 ток/с
+    # при 900 ГБ/с, RTX 3090 — 169 при 936. Поправки — в card_tps_factor.
+    eff = TPS_EFF * min(card_tps_factor(nm) for nm in names)
+    over = TPS_OVERHEAD_DC if any(re.search(DC_HBM, (nm or "").lower()) for nm in names) else TPS_OVERHEAD
+    # каждый переход токена между картами при делении по слоям — копия и синхронизация
+    hops = (n - 1) * TPS_HOP if engine != hfmodels.ENGINE_VLLM else 0.0
+    t = read_gpu_gib * 1.0737 / (bw * eff) + over + hops
     if read_ram_gib:
         ram_bw = (brief.get("ram_channels") or 2) * RAM_CHANNEL_GBS * RAM_EFF
         t += read_ram_gib * 1.0737 / ram_bw
@@ -960,7 +1016,7 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
         if len({a[0] for a in archs}) > 1:
             b["arch"] = "+".join(sorted({a[0] or "?" for a in archs}))
         b["gpu_ok"] = ok
-        if any(re.search(r"cmp", (g or "").lower()) for g in (b.get("gpu_models") or [b["gpu"]])):
+        if any(re.search(r"\bcmp\b", (g or "").lower()) for g in (b.get("gpu_models") or [b["gpu"]])):
             # майнинговая серия: память быстрая, но вычисления урезаны производителем,
             # а объём памяти площадки иногда указывают неверно — оценке скорости не верим
             note = ((note + "; ") if note else "") + ("майнинговая карта (CMP): вычисления урезаны, "
@@ -1132,6 +1188,7 @@ _PROGRESS_CMD = (
 _STAGE_TEXT = {
     "packages": "ставлю пакеты (ждём, пока площадка доустановит свои)",
     "download": "качаю веса",
+    "build": "веса скачаны, собираю движок llama.cpp",
     "engine": "движок запущен, загружает веса в VRAM",
     "failed": "установка на сервере завершилась ошибкой",
 }
@@ -1195,7 +1252,7 @@ def remote_progress(host, port, timeout=20):
             pass
     if not out:
         return None
-    if out[0] in ("engine", "setup", "failed"):
+    if out[0] in ("packages", "build", "engine", "setup", "failed"):
         return {"stage": out[0], "bytes": 0, **pulse}
     if out[0] == "download":
         try:
@@ -2343,8 +2400,9 @@ def deploy(cfg, env=None, logf=log):
         logf(f"очередь аренды из {len(candidates)} серверов — пробую по порядку, "
              f"пока один не поднимется")
     for n, o in enumerate(candidates, 1):
+        arch = f" ({o['arch']})" if o.get("arch") and o["arch"] not in o["gpu"] else ""
         logf(f"кандидат {n}: {o['id']} — {o['gpu_count']}x {o['gpu']}"
-             f"{' (' + o['arch'] + ')' if o.get('arch') else ''} ({o['vram_gb']} GiB VRAM) "
+             f"{arch} ({o['vram_gb']} GiB VRAM) "
              f"${o['price_used']:.3f}/ч, диск {o['disk_gb']} GB, {o['net_down']:.0f} Mbps")
     if cfg.get("dry_run"):
         return {"status": "dry-run", "model": info, "offers": candidates}
@@ -2569,9 +2627,18 @@ def deploy(cfg, env=None, logf=log):
                 return {"status": "fail", "reason": "нет доступа к модели", "access_denied": True,
                         "why": "Hugging Face не даёт скачать закрытую модель"}
             if any("движок не запустился" in f for f in fail_box):
-                # движок упал при загрузке скачанных весов: дело в модели, а не в сервере
                 if tail:
                     lg("последние строки логов сервера:\n" + tail)
+                for f in fail_box:
+                    if "движок не запустился" in f:
+                        lg(f"причина: {f}")
+                if any(re.search(r"не хватило видеопамяти|out of memory|failed to allocate|unable to allocate|cudaMalloc",
+                                 f, re.I) for f in fail_box):
+                    # нехватка видеопамяти — дело в сервере и контексте, а не в модели:
+                    # на сервере с запасом памяти она может подняться
+                    return {"status": "fail", "reason": "не хватило видеопамяти",
+                            "why": "движку не хватило видеопамяти на веса и контекст"}
+                # движок упал при загрузке скачанных весов: дело в модели, а не в сервере
                 return {"status": "fail", "reason": "движок не запустился", "model_problem": True,
                         "arch_unknown": any("unknown model architecture" in f for f in fail_box),
                         "why": "движок не смог загрузить скачанную модель"}
@@ -2757,7 +2824,7 @@ RACE_CULL_AFTER = 3 * 60        # столько сервер должен пр�
 def _deploy_race(candidates, plan, rent, bring_up, drop, finish, clore, env, info, stop, logf):
     """
     Параллельная установка: арендуем все выбранные серверы сразу, побеждает тот, где модель
-    поднялась первой, остальные отменяем. Clore считает аренду поминутно, поэтому проигравшие
+    поднялась первой, остальные отменяем. Аренда считается по фактическому времени, поэтому проигравшие
     стоят минуты, а не часы. Номера всех заказов гонки лежат в .env (RACE_ORDERS), чтобы
     stop.py отменил их, даже если этот процесс упадёт.
     """
@@ -2784,7 +2851,7 @@ def _deploy_race(candidates, plan, rent, bring_up, drop, finish, clore, env, inf
             save_tracked()
 
     logf(f"параллельная установка на {len(candidates)} серверах: побеждает первый, где модель "
-         f"поднимется, остальные отменяю. Clore считает аренду поминутно")
+         f"поднимется, остальные отменяю. Платите только за фактическое время")
     racers = {}           # oid -> состояние
     winner = None
     try:

@@ -383,8 +383,8 @@ Object.assign(window.I18N_EN.exact, {
   'SSH-пароль': 'SSH password',
   'по умолчанию — случайный, в .env': 'default — random, stored in .env',
   'арендовать ещё один сервер': 'rent one more server',
-  'Арендует все выбранные серверы сразу и ставит модель на каждом. Остаётся тот, где она поднялась первой, остальные отменяются; заметно отстающие по скорости скачивания — ещё по ходу. Clore считает аренду поминутно, так что проигравшие стоят минуты':
-    'Rents all selected servers at once and installs the model on each. The one where it comes up first is kept, the rest are cancelled; those clearly lagging in download speed are cancelled along the way. Clore bills rentals per minute, so the losers cost only minutes',
+  'Арендует все выбранные серверы сразу и ставит модель на каждом. Остаётся тот, где она поднялась первой, остальные отменяются; заметно отстающие по скорости скачивания — ещё по ходу. Аренда считается по фактическому времени, так что проигравшие стоят минуты':
+    'Rents all selected servers at once and installs the model on each. The one where it comes up first is kept, the rest are cancelled; those clearly lagging in download speed are cancelled along the way. Rentals are billed for actual time, so the losers cost only minutes',
   'ставить параллельно на все выбранные — оставить самый быстрый': 'install in parallel on all selected — keep the fastest',
   'Проверить без аренды': 'Dry run without renting',
   'Арендовать и развернуть': 'Rent and deploy',
