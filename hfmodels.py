@@ -9,6 +9,7 @@ import concurrent.futures
 import datetime
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -275,8 +276,12 @@ TOP_CODING = [
                        "модель уровня 125B поднимается на самой дешёвой карте, если в "
                        "заказе много памяти. Расплата — генерацию считает CPU, так что "
                        "скорость упирается в каналы памяти, а не в GPU: берите хост на "
-                       "EPYC или Xeon Scalable, подбор серверов это уже учитывает.",
-                "variants": ["huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF"],
+                       "EPYC или Xeon Scalable, подбор серверов это уже учитывает. "
+                       "Версия v2 (с 2026-10) — по словам huihui, изменён акцент абляции и "
+                       "эксперты не тронуты: лучше для кода и текста. Кванты от IQ4_XS до "
+                       "Q8_0 (175 ГиБ); первая версия оставлена для сравнения.",
+                "variants": ["huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF",
+                             "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF"],
             },
             {
                 "title": "Qwen3.8-27B NEO-CODER-MAX",
@@ -367,7 +372,7 @@ TOP_CODING = [
             {
                 "title": "GLM-5.3 Flash",
                 "tier": "одна карта + много RAM",
-                "base": "GLM-5.3 Flash (Zhipu), MoE 288 экспертов, контекст до 1M",
+                "base": "GLM-5.3 Flash (Zhipu), MoE 288 экспертов, база от 2026-08",
                 "why": "Самая залайканная abliterated-сборка GLM (337). Кванты крупные — "
                        "UD-IQ4_XS 146 ГиБ, UD-Q4_K_XL 186, UD-Q5_K_XL 224 — но 98.1% "
                        "веса это эксперты, и с выгрузкой в оперативку на карте остаётся "
@@ -387,7 +392,7 @@ TOP_CODING = [
             {
                 "title": "Devstral Small 2 24B",
                 "tier": "агентный",
-                "base": "Devstral Small 2 (Mistral), плотная 24B",
+                "base": "Devstral Small 2 (Mistral), плотная 24B, база от 2025-11",
                 "why": "Сделана под агентов в коде: 65.8% SWE-bench Verified при 24B — "
                        "лучший результат на гигабайт в списке.",
                 "variants": ["AliBilge/Huihui-Devstral-Small-2-24B-Instruct-2512-abliterated"],
@@ -457,28 +462,92 @@ TOP_UNCENSORED = [
                 "tier": "лучший баланс",
                 "base": "Qwen3.8-Flash-Next, MoE 125B/6B актив., база от 2026-08",
                 "why": "Самая залайканная расцензуренная сборка этой базы — 1.2k лайков, "
-                       "втрое больше ближайшей. Единственная с полной линейкой квантов: "
+                       "втрое больше ближайшей. Полная линейка квантов: "
                        "IQ4_XS 91 ГиБ, Q4_K_M 111, Q5_K_M 125, Q6_K 156, Q8_0 175. "
+                       "Открытая альтернатива с такой же линейкой до Q8_0 — huihui v2 в "
+                       "«Топе для кодинга». "
                        "97.6% веса — эксперты, поэтому с выгрузкой в оперативку хватает "
                        "5-6 ГиБ VRAM при 112-211 ГБ RAM: модель уровня 125B поднимается "
                        "на одной дешёвой карте. Замерено на RTX 5090 с 39 слоями в "
-                       "оперативке — 37 ток/с на генерации.",
+                       "оперативке — 37 ток/с на генерации. Репозиторий закрытый: один раз "
+                       "откройте его страницу на Hugging Face тем же аккаунтом, что и "
+                       "HF_TOKEN, и нажмите «Agree and access repository» — доступ "
+                       "выдаётся сразу. Деплой проверяет это до аренды.",
                 "variants": ["orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"],
             },
             {
                 "title": "GLM-5.3 Flash UNCENSORED",
                 "tier": "тяжёлая, но подъёмная",
-                "base": "GLM-5.3 Flash (Zhipu), MoE 288 экспертов",
+                "base": "GLM-5.3 Flash (Zhipu), MoE 288 экспертов, база от 2026-08",
                 "why": "Максимум качества без отказов. Формат решает цену сервера. "
                        "FP8 идёт на vLLM и быстрее, но весит 306 ГиБ — это 8 карт по "
-                       "48 ГБ. GGUF от orcarouter: Q4_K_M 180 ГиБ, Q6_K 245, Q8_0 318, "
-                       "и у него 98.1% веса приходится на экспертов — с выгрузкой в "
-                       "оперативку на карте остаётся 5.6-8.3 ГиБ, зато нужно 217-379 ГБ "
+                       "48 ГБ. GGUF — две сборки: huihui (Q4_K_XL 186 ГиБ, Q6_K_XL 272) "
+                       "и GCSA-AiLab (Q4 128, Q6 219 и Q8_0 310 ГиБ — единственная "
+                       "совместимая с Q8). Почти весь вес приходится на экспертов — с выгрузкой в "
+                       "оперативку на карте остаются единицы ГиБ, зато нужно 220+ ГБ "
                        "RAM. Контекст до 1M. Если RAM на хосте много, GGUF выходит в "
                        "разы дешевле FP8 — но генерацию считает CPU, берите хост "
-                       "на EPYC или Xeon Scalable.",
+                       "на EPYC или Xeon Scalable. GGUF от orcarouter убран: он сделан "
+                       "под экспериментальную ветку llama.cpp (архитектура «glm5next») "
+                       "и на обычном llama.cpp не запускается.",
                 "variants": ["dealignai/GLM-5.3-Flash-UNCENSORED-FP8",
-                             "orcarouter/GLM-5.3-Flash-Uncensored-GGUF"],
+                             "huihui-ai/Huihui-GLM-5.3-Flash-abliterated-GGUF",
+                             "GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF"],
+            },
+            {
+                "title": "Inkling-2-Mini Uncensored (AtomicChat)",
+                "tier": "свежая, лёгкая",
+                "base": "Inkling-2-Mini (Thinking Machines), MoE 26.4B, выпуск от 2026-11",
+                "why": "Самая быстрорастущая расцензуренная сборка ноября: 760k скачиваний "
+                       "и почти 1k лайков за неделю. Веса небольшие — Q4_K 15.4 ГиБ, "
+                       "Q8_0 26 ГиБ, контекст до 1M. Кэш контекста крупный: на 262k "
+                       "нужно ~30 ГиБ VRAM, на карте 24 ГБ приложение само уменьшит "
+                       "контекст. Шаблон чата совпадает с оригиналом. Модели неделя — "
+                       "независимых замеров пока нет.",
+                "variants": ["AtomicChat/Inkling-2-Mini-Uncensored-GGUF"],
+            },
+            {
+                "title": "Gemma 4 31B ARA heretic",
+                "tier": "плотная, в одну карту",
+                "base": "Gemma-4-31B-it (Google), плотная 31.3B, выпуск от 2026-11",
+                "why": "Старшая Gemma 4 со снятыми отказами (heretic): 260k скачиваний за "
+                       "месяц. Q4_K_M 17.4 ГиБ, Q6_K 23.5, Q8_0 30.4 — Q4 помещается в "
+                       "карту на 24 ГБ с урезанным контекстом. Шаблон чата — официальный "
+                       "Gemma 4 с исправлениями вызова инструментов.",
+                "variants": ["mradermacher/gemma-4-31B-it-ARA-heretic-GGUF"],
+            },
+            {
+                "title": "DeepSeek-V4-Pro → Qwen3.5-9B heretic",
+                "tier": "для слабой карты",
+                "base": "DeepSeek-V4-Pro-Qwen3.5-9B (xtools-at), плотная 9B, выпуск от 2026-11",
+                "why": "Дистилляция DeepSeek-V4-Pro в Qwen3.5-9B со снятыми отказами — "
+                       "1.2M скачиваний за две недели. Q4_K_M 5.4 ГиБ, Q8_0 9.1 — "
+                       "влезает в карту на 8 ГБ. Чудес от 9B не ждите: для правок и "
+                       "вопросов, не для работы со всем репозиторием.",
+                "variants": ["mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF"],
+            },
+            {
+                "title": "DeepSeek V4.1 Flash Uncensored GSQ-RCO (AtomicChat)",
+                "tier": "самая доступная DeepSeek",
+                "base": "DeepSeek V4.1 Flash 1017 (GSQ-RCO), MoE 384 эксперта, база от 2026-10",
+                "why": "DeepSeek V4.1 в сверхнизких квантах: IQ1_M 112 ГиБ, IQ2_XXS 129, "
+                       "IQ2_XS 145 — против 397 ГиБ у обычной сборки. Метод GSQ-RCO, по "
+                       "заявлению авторов, держит качество на 2 битах заметно лучше "
+                       "обычного квантования, но это всё равно 1–2 бита: для сложного "
+                       "кода берите полную сборку из «Топа для кодинга». С экспертами в "
+                       "оперативке — около 16 ГиБ VRAM и 175 ГБ RAM. Контекст до 1M.",
+                "variants": ["AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF"],
+            },
+            {
+                "title": "Hy4-flash Uncensored (Tencent)",
+                "tier": "новая база, только низкие кванты",
+                "base": "Hy4-flash (Tencent), MoE 220B, выпуск от 2026-11",
+                "why": "Свежая MoE-модель Tencent со снятыми отказами, контекст до 1M с "
+                       "лёгким кэшем. Есть только низкие кванты: IQ2_XXS 107 ГиБ и Q3_K "
+                       "139 ГиБ. С экспертами в оперативке — около 14 ГиБ VRAM и 170 ГБ "
+                       "RAM. Сборке неделя, у неё мало отзывов — пробуйте, если нужен "
+                       "длинный контекст подешевле.",
+                "variants": ["alesha-pro/Hy4-flash-Uncensored-GGUF"],
             },
         ],
     },
@@ -566,6 +635,15 @@ TOP_ECONOMY = [
                        "осенью 2026. Расцензуренной сборки с обычными квантами нет. "
                        "Q4_K_M — 5.4 ГиБ.",
                 "variants": ["bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF"],
+            },
+            {
+                "title": "DeepSeek-V4-Pro → Qwen3.5-9B",
+                "tier": "без цензуры",
+                "base": "DeepSeek-V4-Pro-Qwen3.5-9B (xtools-at), плотная 9B, выпуск от 2026-11",
+                "why": "Дистилляция DeepSeek-V4-Pro в Qwen3.5-9B со снятыми отказами "
+                       "(heretic), 1.2M скачиваний. Q4_K_M — 5.4 ГиБ. Независимых замеров "
+                       "пока нет; для кода надёжнее Qwen3.5-9B выше.",
+                "variants": ["mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF"],
             },
             {
                 "title": "Gemma 4 E4B",
@@ -717,6 +795,16 @@ TOP_ECONOMY = [
                        "в шаблон зашит скрытый системный промпт.",
                 "variants": ["unsloth/Muse-Glimmer-30B-GGUF",
                              "bartowski/darkc0de_Muse-Glimmer-30B-heretic-GGUF"],
+            },
+            {
+                "title": "Gemma 4 31B",
+                "tier": "плотная от Google",
+                "base": "Gemma-4-31B-it (Google), плотная 31.3B, база от 2026-03",
+                "why": "Старшая Gemma 4. Q4_K_M — 17.4 ГиБ, в 24 ГБ помещается с "
+                       "урезанным контекстом (приложение подгонит само). Расцензуренная "
+                       "сборка ARA heretic — с официальным шаблоном чата.",
+                "variants": ["unsloth/gemma-4-31B-it-GGUF",
+                             "mradermacher/gemma-4-31B-it-ARA-heretic-GGUF"],
             },
         ],
     },
@@ -1009,6 +1097,22 @@ def kv_cache_gib(cfg, ctx, engine):
         total = full * full_token * ctx + sliding * per_token * min(ctx, int(window))
         return round(total * nbytes / GIB, 1)
     return round(attn_layers * per_token * ctx * nbytes / GIB, 1)
+
+
+def token_read_gib(weights_gib, moe=None, cpu_moe=False):
+    """
+    Сколько ГиБ весов читается на каждый сгенерированный токен: (с карт, из RAM).
+    Плотная модель читает все веса. MoE — общую часть и только активных экспертов:
+    у Qwen3.8-Flash-Next это ~3 ГиБ из 104. При выгрузке экспертов в оперативку их
+    часть читается уже из RAM — и скорость определяет она.
+    """
+    w = float(weights_gib or 0)
+    if not moe or not moe.get("experts") or not moe.get("active"):
+        return w, 0.0
+    share = float(moe.get("expert_share") or 0)
+    experts = w * share * float(moe["active"]) / float(moe["experts"])
+    shared = w * (1 - share)
+    return (round(shared, 3), round(experts, 3)) if cpu_moe else (round(shared + experts, 3), 0.0)
 
 
 def default_ctx(cfg, ctx_max, engine):
@@ -1439,6 +1543,81 @@ def _config_with_base(repo_id, meta, own_cfg, token=None):
     return own_cfg
 
 
+# Архитектуры, которые знает llama.cpp. Серверы собирают его из основной ветки, поэтому
+# сверяемся с ней же. Бывают GGUF, сделанные под экспериментальную ветку до того, как
+# поддержку модели приняли: у GLM-5.3 Flash от orcarouter в файле «glm5next», а в
+# llama.cpp она называется «glm5-next». Такой файл не откроется ни на одном сервере —
+# раньше это выяснялось после аренды и скачивания 300 ГиБ.
+LLAMACPP_ARCH_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/src/llama-arch.cpp"
+_ARCHS = {"t": 0.0, "names": None}
+# не архитектуры языковой модели (проектор картинок, служебные) — по ним не судим
+_ARCH_IGNORE = {"clip", "mmproj", ""}
+
+
+def llamacpp_archs(timeout=15):
+    """Множество имён архитектур llama.cpp (кэш на 6 ч) или None, если не скачалось."""
+    if _ARCHS["names"] is not None and time.time() - _ARCHS["t"] < 6 * 3600:
+        return _ARCHS["names"]
+    try:
+        req = urllib.request.Request(LLAMACPP_ARCH_URL, headers={"User-Agent": "UncensoredAI/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            src = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return _ARCHS["names"]
+    names = set(re.findall(r'\{\s*LLM_ARCH_\w+\s*,\s*"([^"]+)"\s*\}', src))
+    if len(names) > 20:          # разбор явно удался — иначе лучше не судить вовсе
+        _ARCHS.update(t=time.time(), names=names)
+    return _ARCHS["names"]
+
+
+def gguf_arch_status(arch):
+    """(True | False | None, ближайшее известное имя) — знает ли llama.cpp эту архитектуру."""
+    arch = str(arch or "").strip()
+    if arch.lower() in _ARCH_IGNORE:
+        return None, ""
+    names = llamacpp_archs()
+    if not names:
+        return None, ""
+    if arch in names:
+        return True, ""
+    import difflib
+    near = difflib.get_close_matches(arch, sorted(names), n=1, cutoff=0.6)
+    return False, near[0] if near else ""
+
+
+def can_download(repo_id, path, token=None, timeout=20):
+    """
+    Пустит ли Hugging Face скачать файл с этим токеном: (True|False|None, пояснение).
+    None — проверить не вышло (сеть). У закрытых репозиториев мало иметь HF_TOKEN:
+    владелец аккаунта должен ещё принять условия на странице модели (gated=auto
+    выдаёт доступ сразу после нажатия, gated=manual — после одобрения автором).
+    Без этого скачивание на сервере отвечает «Access denied … requires approval».
+    """
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{urllib.parse.quote(path)}"
+    headers = {"User-Agent": "UncensoredAI/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None     # редирект на CDN уже означает «можно», качать не нужно
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(urllib.request.Request(url, headers=headers, method="HEAD"), timeout=timeout):
+            return True, ""
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            return True, ""
+        if e.code in (401, 403):
+            return False, f"HTTP {e.code}"
+        if e.code == 404:
+            return False, "файл не найден"
+        return None, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return None, str(e)
+
+
 def model_info(ref, ctx=None, token=None):
     """Полная карточка модели: формат, движок, размер весов, оценка нужных VRAM и диска."""
     repo_id = normalize_ref(ref)
@@ -1515,6 +1694,12 @@ def model_info(ref, ctx=None, token=None):
         "params_b": detect_params(repo_id),
         "uncensored": bool(_UNCENSORED_RE.search(repo_id)),
         "gated": bool(meta.get("gated")),
+        "gated_mode": str(meta.get("gated") or ""),   # auto — доступ сразу, manual — одобряет автор
+        # архитектура из метаданных GGUF и знает ли её llama.cpp (None — не проверить)
+        "arch": str((meta.get("gguf") or {}).get("architecture") or ""),
+        **dict(zip(("arch_supported", "arch_near"),
+                   gguf_arch_status((meta.get("gguf") or {}).get("architecture"))
+                   if fmt == "gguf" else (None, ""))),
         "downloads": int(meta.get("downloads") or 0),
         "likes": int(meta.get("likes") or 0),
         "updated": (meta.get("lastModified") or "")[:10],

@@ -588,7 +588,11 @@ window.I18N_EN.patterns.push(
   [/^уже выбрано (\d+) серверов — больше Clore пробовать не станем$/, '$1 servers already selected — Clore won\'t try more than that'],
   [/^сервер (\d+) — (\d+)-й в очереди аренды$/, 'server $1 — #$2 in the rental queue'],
   [/^показаны (\d+) самых выгодных из (\d+) — уточните запрос в поле «Поиск»$/, 'showing the $1 best-value servers out of $2 — refine the query in the "Search" field'],
-  [/^(\d+) с — Clore отвечает медленно, жду$/, '$1 s — Clore is responding slowly, waiting'],
+  [/^(\d+) с — (\S+) отвечает медленно, жду$/, '$1 s — $2 is responding slowly, waiting'],
+  [/^запрашиваю маркетплейс (\S+)…$/, 'querying the $1 marketplace…'],
+  [/^заказ ([A-Za-z]\S*)$/, '$1 order'],
+  [/^☁ Сервер (\S+)$/, '☁ $1 server'],
+  [/^Арендовать сервер с видеокартой на (\S+)$/, 'Rent a GPU server on $1'],
 
   // ───────── план деплоя ─────────
   [/^: нужно ≈([\d.,]+) GiB VRAM и ([\d.,]+) GB диска, качать ([\d.,]+) GiB\.$/, ': needs ≈$1 GiB VRAM and $2 GB of disk, download $3 GiB.'],
@@ -662,6 +666,56 @@ window.I18N_EN.patterns.push([
   /^(.+?), (плотная|MoE) (.+?), (база|выпуск) от (.+)$/,
   (m, title, kind, size, when, rest) =>
     `${title.replace(/ в тернарных весах/g, ' in ternary weights')}, ` +
-    `${kind === 'плотная' ? 'dense' : 'MoE'} ${size.replace(/ актив\.$/, ' active')}, ` +
+    `${kind === 'плотная' ? 'dense' : 'MoE'} ${size.replace(/ актив\.$/, ' active')
+      .replace(/(\d+) эксперт(а|ов)?/g, '$1 experts')}, ` +
     `${when === 'база' ? 'base from' : 'released'} ${rest}`,
 ]);
+
+// ───────── сортировка серверов и оценка скорости ─────────
+Object.assign(window.I18N_EN.exact, {
+  'Сортировка': 'Sort',
+  'цена/скорость': 'price/speed',
+  'цена ↑': 'price ↑',
+  'лучшая цена/скорость': 'best price/speed',
+  'скорость ?': 'speed ?',
+  'Цена/скорость — сколько токенов в секунду даёт каждый доллар в час: свежая карта бывает в разы быстрее старой за те же деньги. Цена ↑ — просто дешевле сначала':
+    'Price/speed — how many tokens per second each dollar per hour buys: a newer card can be several times faster than an old one for the same money. Price ↑ — simply cheapest first',
+  'Оценка скорости генерации для выбранной модели и кванта: пропускная способность памяти карт / объём весов, читаемых на токен. Сверена с живыми замерами (±10%)':
+    'Estimated generation speed for the selected model and quant: GPU memory bandwidth / weights read per token. Checked against real measurements (±10%)',
+  'майнинговая карта (CMP): вычисления урезаны, реальная скорость может быть заметно ниже оценки':
+    'mining card (CMP): compute is cut down, real speed may be well below the estimate',
+});
+window.I18N_EN.patterns.push(
+  [/^≈(\d+) ток\/с$/, '≈$1 tok/s'],
+  // «$1» здесь буквальный доллар, а не подстановка — поэтому функция, а не строка
+  [/^([\d.]+) за \$1\/ч$/, (m, n) => `${n} per $1/h`],
+);
+
+// ───────── закрытые модели Hugging Face (карточка модели и план деплоя) ─────────
+Object.assign(window.I18N_EN.exact, {
+  'закрытая модель': 'gated model',
+  '🔓 Модель закрытая, но ваш HF_TOKEN уже имеет к ней доступ.': '🔓 The model is gated, but your HF_TOKEN already has access to it.',
+  '⚠ Модель закрытая: без принятия условий на Hugging Face она не скачается — ни на сервер, ни на этот ПК.':
+    '⚠ This model is gated: it cannot be downloaded — neither to a server nor to this PC — until its terms are accepted on Hugging Face.',
+  'Создайте токен с правом чтения (Read):': 'Create a token with Read access:',
+  'Впишите его в поле HF_TOKEN на вкладке «Настройки» и сохраните.': 'Put it into the HF_TOKEN field on the "Settings" tab and save.',
+  'Откройте': 'Open',
+  'тем же аккаунтом и примите условия.': 'with the same account and accept the terms.',
+  'Hugging Face не принял ваш HF_TOKEN — создайте новый (Read):': 'Hugging Face rejected your HF_TOKEN — create a new one (Read):',
+  'Замените им HF_TOKEN на вкладке «Настройки».': 'Replace HF_TOKEN with it on the "Settings" tab.',
+  'Убедитесь, что условия на': 'Make sure the terms on',
+  'приняты этим же аккаунтом.': 'are accepted by the same account.',
+  'и войдите в аккаунт Hugging Face, чей токен вписан в HF_TOKEN.': 'and sign in to the Hugging Face account whose token is in HF_TOKEN.',
+  'Нажмите над списком файлов «Agree and access repository».': 'Click "Agree and access repository" above the file list.',
+  'Нажмите над списком файлов «Agree and access repository» (или «Request access»).': 'Click "Agree and access repository" (or "Request access") above the file list.',
+  'Доступ к этой модели одобряет её автор вручную — дождитесь письма от Hugging Face.': 'Access to this model is approved manually by its author — wait for an email from Hugging Face.',
+  'Доступ выдаётся сразу после нажатия.': 'Access is granted right after the click.',
+  'Проверить доступ снова': 'Check access again',
+  '⚠ Модель закрытая, доступа у вашего HF_TOKEN нет — деплой остановится до аренды. Примите условия:':
+    '⚠ The model is gated and your HF_TOKEN has no access — the deploy will stop before renting. Accept the terms:',
+  '(подробности — в карточке на вкладке «Модель»).': '(details are in the card on the "Model" tab).',
+});
+window.I18N_EN.patterns.push(
+  [/^Модель закрытая; проверить доступ сейчас не вышло \((.+)\)\. Перед арендой деплой проверит его ещё раз\.$/,
+    'The model is gated; access could not be checked right now ($1). The deploy will check it again before renting.'],
+);

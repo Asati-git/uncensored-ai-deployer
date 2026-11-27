@@ -61,7 +61,7 @@ _DETAILS = {
 
 
 class CloreError(RuntimeError):
-    def __init__(self, code, detail=None, uncertain=False, not_sent=False):
+    def __init__(self, code, detail=None, uncertain=False, not_sent=False, source="Clore API"):
         self.code = code
         # True — запрос точно не выполнен (пауза после сбоя, лимит частоты): его можно
         # повторить позже, и сервер из-за этого пропускать не нужно
@@ -73,7 +73,7 @@ class CloreError(RuntimeError):
         msg = _ERRORS.get(code, f"код ответа {code}")
         if detail:
             msg += f" ({_DETAILS.get(str(detail), detail)})"
-        super().__init__(f"Clore API: {msg}")
+        super().__init__(f"{source}: {msg}")
 
 
 # Состояние, общее для всех клиентов с одним ключом. UI создаёт новый Clore на каждый
@@ -416,7 +416,8 @@ class Clore:
 
     def create_order(self, server_id, image, currency="bitcoin", order_type="on-demand",
                      ports=None, env=None, command=None, ssh_password=None, ssh_key=None,
-                     spot_price=None, required_price=None, autossh_entrypoint=False):
+                     spot_price=None, required_price=None, autossh_entrypoint=False,
+                     disk_gb=None):   # disk_gb: Clore диск не заказывает, параметр для других площадок
         body = {
             "currency": currency,
             "image": image,
@@ -668,6 +669,8 @@ def server_brief(server, rates=None):
         "disk_speed": specs.get("disk_speed"),
         "cpu": specs.get("cpu"),
         "ram_channels": ram_channels(server),      # важно только при выгрузке в RAM
+        # пропускная способность памяти карты, ГБ/с, если площадка её сообщает (Clore — нет)
+        "mem_bw": float(specs.get("gpu_mem_bw") or 0) or None,
         "net_down": net_down(server),             # как показывает Clore (последний замер)
         "net_down_est": net_down_est(server),      # на что рассчитывать: медиана замеров
         "net_tests": len(net_history(server)),

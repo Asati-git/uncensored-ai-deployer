@@ -231,6 +231,23 @@ I18N_EN.patterns.push(
   [/^(.+?): (.+?), контекст (\d+)k — (.+) \(на (\d+)k не хватает памяти\)$/, '$1: $2, context $3k — $4 (not enough memory for $5k)'],
   [/^(.+?): (.+?), контекст (\d+)k — (.+)$/, '$1: $2, context $3k — $4'],
 
+  // закрытые модели Hugging Face: подробная инструкция — в логе деплоя
+  [/^модель закрытая, а HF_TOKEN не задан — что сделать, написано в логе выше\. Страница модели: (\S+)\. Ничего не арендовано$/,
+    'the model is gated and HF_TOKEN is not set — see the deploy log above for what to do. Model page: $1. Nothing was rented'],
+  [/^нет доступа к закрытой модели на Hugging Face \((.+?)\) — что сделать, написано в логе выше\. Страница модели: (\S+)\. Ничего не арендовано$/,
+    'no access to the gated model on Hugging Face ($1) — see the deploy log above for what to do. Model page: $2. Nothing was rented'],
+  [/^нет доступа к закрытой модели (\S+) — остальные серверы очереди не пробую, там было бы то же самое\. Что сделать, написано в логе выше$/,
+    'no access to the gated model $1 — not trying the remaining queued servers, the result would be the same. See the deploy log above for what to do'],
+  [/^нет доступа к закрытой модели (\S+) — все серверы гонки отменены\. Что сделать, написано в логе выше$/,
+    'no access to the gated model $1 — all race servers were cancelled. See the deploy log above for what to do'],
+  [/^llama\.cpp не знает архитектуру «(.+?)» из этой сборки — модель не запустится ни на одном сервере\. Что сделать, написано в логе выше\. Ничего не арендовано$/,
+    'llama.cpp does not know the "$1" architecture of this build — the model will not start on any server. See the deploy log above for what to do. Nothing was rented'],
+  [/^llama\.cpp не знает архитектуру этой сборки — все серверы гонки отменены\. Что сделать, написано в логе выше$/,
+    'llama.cpp does not know the architecture of this build — all race servers were cancelled. See the deploy log above for what to do'],
+  [/^⚠ Эта сборка не запустится: файлы записаны с архитектурой «(.+?)», а llama\.cpp такой не знает — их делали под экспериментальную ветку\. Возьмите другую GGUF-сборку этой модели \(в метаданных GGUF должна стоять архитектура «(.+?)»\)\.$/,
+    '⚠ This build will not start: its files use the "$1" architecture, which llama.cpp does not know — they were made for an experimental branch. Pick another GGUF build of this model (its GGUF metadata should say "$2").'],
+  [/^⚠ Эта сборка не запустится: файлы записаны с архитектурой «(.+?)», а llama\.cpp такой не знает — их делали под экспериментальную ветку\. Возьмите другую GGUF-сборку этой модели\.$/,
+    '⚠ This build will not start: its files use the "$1" architecture, which llama.cpp does not know — they were made for an experimental branch. Pick another GGUF build of this model.'],
   // предупреждения выводятся одной строкой с «⚠ » впереди
   [/^⚠ (.+)$/, '⚠ $1'],
 );

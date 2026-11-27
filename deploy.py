@@ -327,10 +327,64 @@ def tg(env, text):
         log(f"TG ошибка: {e}")
 
 
-def client(env, stop=None):
+# ───────── площадки аренды ─────────
+# Встроена одна — Clore. Дополнительные подключаются модулями из локальной папки
+# extensions/ рядом с программой: модуль объявляет register(deploy) и в нём вызывает
+# register_provider. Клиент площадки говорит тем же языком, что клиент Clore:
+# marketplace / my_orders / order / create_order / cancel_order / wallets /
+# currency_rates с теми же полями в ответах, ошибки — CloreError. Тогда подбор,
+# очередь, гонка, отмена и OpenCode работают с ним без единой правки.
+PROVIDERS = {}
+DEFAULT_PROVIDER = "clore"
+
+
+def register_provider(pid, title, key, make):
+    """make(api_key, stop=None, stop_exc=None) -> клиент; key — имя переменной ключа в .env."""
+    PROVIDERS[pid] = {"id": pid, "title": title, "key": key, "make": make}
+
+
+register_provider("clore", "Clore", "CLORE_API_KEY",
+                  lambda key, stop=None, stop_exc=None: Clore(
+                      key, stop=stop, **({"stop_exc": stop_exc} if stop_exc else {})))
+
+
+def provider_of(env, provider=None):
+    """Площадка: явно заданная, иначе та, где взят текущий заказ из .env."""
+    pid = provider or (env or {}).get("PROVIDER") or DEFAULT_PROVIDER
+    if pid not in PROVIDERS:
+        raise SystemExit(f"площадка «{pid}» не подключена")
+    return pid
+
+
+def provider_key(env, provider=None):
+    return (env.get(PROVIDERS[provider_of(env, provider)]["key"]) or "").strip()
+
+
+def client(env, stop=None, provider=None):
     # stop прокидывается в клиент: ожидание ответа Clore (повторы, паузы) обрывается
     # кнопкой «Стоп», а не досиживается до конца — до аренды это минуты при сбоях сети
-    return Clore(env.get("CLORE_API_KEY") or "", stop=stop, stop_exc=DeployStopped)
+    p = PROVIDERS[provider_of(env, provider)]
+    return p["make"](env.get(p["key"]) or "", stop=stop, stop_exc=DeployStopped)
+
+
+def _load_extensions():
+    """Модули площадок из extensions/. Сломанный модуль не должен ронять программу."""
+    import importlib.util
+    folder = os.path.join(HERE, "extensions")
+    if not os.path.isdir(folder):
+        return
+    me = sys.modules[__name__]
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".py") or name.startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"_ext_{name[:-3]}", os.path.join(folder, name))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, "register"):
+                mod.register(me)
+        except Exception as e:  # noqa
+            print(f"расширение {name} не загрузилось: {e}", file=sys.stderr)
 
 
 def wait_clore(clore, logf=log, stop=None):
@@ -623,6 +677,100 @@ MIN_CC_PRECISION = {
 RECOMMENDED_CC = 8.0
 
 
+# ───────── оценка скорости генерации ─────────
+# Генерация упирается не в вычисления, а в память: на каждый токен карта читает все
+# активные веса модели. Поэтому скорость ≈ пропускная способность видеопамяти / объём
+# чтения на токен, и RTX 5090 (1.8 ТБ/с) за те же деньги выдаёт в разы больше токенов,
+# чем RTX 3070 (0.45 ТБ/с), даже если у неё меньше памяти. Пропускная способность одной
+# карты, ГБ/с, — по паспортным данным; площадка может сообщить её сама (mem_bw).
+GPU_BW = [
+    # Blackwell
+    (r"\bb[12]00\b|gb[23]00", 8000), (r"\bgb10\b", 273),
+    (r"rtx\s*pro\s*6000", 1792), (r"rtx\s*pro\s*5000", 1344), (r"rtx\s*pro\s*4500", 896),
+    (r"rtx\s*pro\s*4000", 672), (r"5090", 1792), (r"5080", 960), (r"5070\s*ti", 896),
+    (r"5070", 672), (r"5060", 448),
+    # Hopper
+    (r"h200", 4800), (r"gh200", 4000), (r"h100.*nvl", 3900), (r"h100.*pcie", 2000), (r"h100|h800", 3350),
+    # Ada
+    (r"(rtx\s*)?6000\s*ada|5880\s*ada", 960), (r"5000\s*ada", 576), (r"4500\s*ada", 432),
+    (r"4000\s*ada", 360), (r"2000\s*ada", 224), (r"\bl40s?\b", 864), (r"\bl4\b", 300),
+    (r"4090", 1008), (r"4080", 717), (r"4070\s*ti\s*super", 672), (r"4070", 504),
+    (r"4060\s*ti", 288), (r"4060", 272),
+    # Ampere
+    (r"a100.*(80|sxm)|a800", 2039), (r"a100", 1555), (r"\ba40\b", 696), (r"\ba30\b", 933),
+    (r"\ba10\b", 600), (r"\ba16\b", 200), (r"a6000", 768), (r"a5000", 768), (r"a4500", 640),
+    (r"a4000", 448), (r"a2000", 288), (r"cmp\s*170hx", 1493),
+    (r"3090\s*ti", 1008), (r"3090", 936), (r"3080\s*ti", 912), (r"3080", 760),
+    (r"3070\s*ti", 608), (r"3070|3060\s*ti", 448), (r"3060", 360),
+    # Turing и старше
+    (r"titan\s*rtx|(quadro|q)\s*rtx\s*[68]000", 672), (r"2080\s*ti", 616), (r"2080", 448),
+    (r"2070|2060\s*super", 448), (r"2060", 336), (r"\bt4\b", 320),
+    (r"1660\s*(ti|s)", 336), (r"1660", 192), (r"v100", 900), (r"titan\s*v", 653),
+    (r"p100", 732), (r"\bp40\b", 347), (r"1080\s*ti", 484), (r"1080", 320), (r"1070", 256),
+    (r"1060|\bp4\b", 192),
+]
+TPS_EFF = 0.9            # доля паспортной пропускной способности, которую выжимает движок
+TPS_OVERHEAD = 0.002     # постоянные расходы на токен, с — заметны только у малых моделей
+RAM_CHANNEL_GBS = 25.6   # один канал DDR4-3200, ГБ/с
+RAM_EFF = 0.45           # доля, которую реально выжимает llama.cpp на экспертах в RAM
+# Откалибровано по живым замерам: 4× RTX 5080 + Qwen3.8-27B Q8 — 30 ток/с (оценка 28);
+# GTX 1660 S + Qwen2.5-0.5B Q4 — 280 ток/с (оценка 277); RTX 5090 + Qwen3.8-Flash-Next
+# с экспертами в 8-канальной RAM — 37 ток/с (оценка ~37).
+
+
+def gpu_bandwidth(name):
+    """Пропускная способность памяти одной карты, ГБ/с; None — карта не из таблицы."""
+    low = (name or "").lower()
+    for pat, bw in GPU_BW:
+        if re.search(pat, low):
+            return bw
+    return None
+
+
+# Площадка может сообщить пропускную способность, ИЗМЕРЕННУЮ на этом хосте (некоторые
+# так делают): обычно это ~86% паспортной (RTX 3090: 802 из 936, H100: 2860 из 3350), но
+# встречаются урезанные хосты — RTX 5090 с 619 ГБ/с. Замер ценнее паспорта: медленный
+# хост честно опускается в списке. Пересчитываем его в паспортный эквивалент (под него
+# откалиброван TPS_EFF) и не даём единичному кривому замеру уронить карту ниже половины
+# паспорта или поднять выше него.
+MEASURED_TO_SPEC = 0.86
+
+
+def _card_bw(spec, measured):
+    if measured and spec:
+        return min(spec, max(measured / MEASURED_TO_SPEC, spec * 0.5))
+    if measured:
+        return measured / MEASURED_TO_SPEC
+    return spec
+
+
+def estimate_tps(brief, read_gpu_gib, read_ram_gib=0.0, engine=None):
+    """
+    Оценка скорости генерации на сервере, ток/с. read_gpu_gib — сколько ГиБ весов
+    читается с карт на каждый токен, read_ram_gib — сколько из оперативки (эксперты
+    MoE при выгрузке). None — пропускная способность карт неизвестна.
+    """
+    if not read_gpu_gib and not read_ram_gib:
+        return None
+    names = brief.get("gpu_models") or [brief.get("gpu")] * max(int(brief.get("gpu_count") or 1), 1)
+    bws = [_card_bw(gpu_bandwidth(n), brief.get("mem_bw")) for n in names]
+    if not bws or any(not b for b in bws):
+        return None
+    n = len(bws)
+    if engine == hfmodels.ENGINE_VLLM and n > 1 and not n & (n - 1):
+        # tensor-parallel: карты читают свою долю весов одновременно
+        bw = min(bws) * n * 0.75
+    else:
+        # llama.cpp делит модель по слоям: карты работают по очереди, и токен проходит
+        # их все — скорость как у одной карты (самой медленной)
+        bw = min(bws)
+    t = read_gpu_gib * 1.0737 / (bw * TPS_EFF) + TPS_OVERHEAD
+    if read_ram_gib:
+        ram_bw = (brief.get("ram_channels") or 2) * RAM_CHANNEL_GBS * RAM_EFF
+        t += read_ram_gib * 1.0737 / ram_bw
+    return round(1 / t, 1)
+
+
 def gpu_arch(name):
     """('8x Tesla V100SXM232GB') -> ('Volta', 7.0); неизвестная карта -> (None, None)."""
     low = (name or "").lower()
@@ -715,7 +863,8 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
                 gpu_filter=None, order_type="on-demand", min_net=MIN_NET_DOWN_MBPS,
                 download_gib=0, limit=25, engine=None, quant=None, allow_old_gpu=False,
                 balance_usd=None, min_reliability=MIN_RELIABILITY, spread=False,
-                hidden=None, blacklist=None, need_ram=0, cpu_moe=False, servers=None):
+                hidden=None, blacklist=None, need_ram=0, cpu_moe=False, servers=None,
+                read_gpu_gib=0.0, read_ram_gib=0.0, sort="value"):
     """
     Серверы, которые вместят модель, отсортированные по цене в USD с учётом времени скачивания.
     engine/quant — чтобы отсеять карты, на которых выбранный движок не заведётся
@@ -738,6 +887,10 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
     фильтр. Без этого список выглядел необъяснимо коротким (из полутора тысяч свободных
     серверов до пользователя доходило семьдесят), и понять, какой фильтр ослабить,
     было нельзя.
+    read_gpu_gib / read_ram_gib — сколько весов читается на токен с карт и из RAM
+    (см. hfmodels.token_read_gib): по ним оценивается скорость генерации.
+    sort — "value": больше токенов в секунду на каждый доллар в час (по умолчанию);
+    "price": дешевле сначала.
     spread — перемешать кандидатов с близкой ценой. Нужно, когда деплоев несколько сразу:
     иначе все выбирают один и тот же самый дешёвый сервер, дерутся за него и получают
     отказ «уже арендован». Без флага перемешиваются только точные совпадения по цене.
@@ -807,6 +960,11 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
         if len({a[0] for a in archs}) > 1:
             b["arch"] = "+".join(sorted({a[0] or "?" for a in archs}))
         b["gpu_ok"] = ok
+        if any(re.search(r"cmp", (g or "").lower()) for g in (b.get("gpu_models") or [b["gpu"]])):
+            # майнинговая серия: память быстрая, но вычисления урезаны производителем,
+            # а объём памяти площадки иногда указывают неверно — оценке скорости не верим
+            note = ((note + "; ") if note else "") + ("майнинговая карта (CMP): вычисления урезаны, "
+                                                       "реальная скорость может быть заметно ниже оценки")
         b["gpu_note"] = note
         if pay_currency:  # пользователь жёстко задал валюту списания
             coin = price_of(s, pay_currency, order_type)
@@ -836,10 +994,25 @@ def find_offers(clore, need_vram, need_disk, max_price_usd=None, pay_currency=No
         # выдаст вдвое меньше токенов, чем четырёхканальный, и дешевизна его не спасает.
         # Приводим цену к «за токен»: четыре канала считаем единицей отсчёта.
         ram_factor = 4.0 / max(b.get("ram_channels") or 2, 1) if cpu_moe else 1.0
-        b["score"] = price * (1 + dl_hours) * ram_factor
+        tps = estimate_tps(b, read_gpu_gib, read_ram_gib if cpu_moe else 0.0, engine)
+        b["tps_est"] = tps
+        # сколько токенов в секунду даёт каждый доллар в час — мера «цена/скорость»
+        b["tps_per_usd"] = round(tps / price, 1) if tps else None
+        if sort == "value" and tps:
+            # ровно та цифра, что видна в списке: доллары в час за каждый «токен в секунду».
+            # Время скачивания сюда не примешиваем — иначе порядок расходился с цифрой
+            b["score"] = price / tps
+        elif sort == "value":
+            b["score"] = float("inf")     # скорость неизвестна — в конец списка
+        else:
+            b["score"] = price * (1 + dl_hours) * ram_factor
         out.append(b)
-    out.sort(key=lambda x: x["score"])
-    if out:
+    if sort == "value":
+        # серверы с неизвестной скоростью — после оценённых, между собой по цене
+        out.sort(key=lambda x: (x["score"], x["price_used"]))
+    else:
+        out.sort(key=lambda x: x["score"])
+    if out and out[0]["score"] != float("inf"):
         # «почти та же цена» считаем равнозначной и тасуем: одинаковые запуски
         # перестают ломиться на один хост, а переплата остаётся в пределах SPREAD_RATIO
         best = out[0]["score"]
@@ -957,7 +1130,7 @@ _PROGRESS_CMD = (
 
 
 _STAGE_TEXT = {
-    "packages": "ставлю пакеты (ждём, пока Clore доустановит свои)",
+    "packages": "ставлю пакеты (ждём, пока площадка доустановит свои)",
     "download": "качаю веса",
     "engine": "движок запущен, загружает веса в VRAM",
     "failed": "установка на сервере завершилась ошибкой",
@@ -1147,8 +1320,62 @@ def wait_alive(host, ports, url, key, logf=log, limit=SILENT_LIMIT, stop=None):
     return None
 
 
+def hf_access_help(repo, reason="terms", mode=""):
+    """
+    Что делать, если Hugging Face не отдаёт веса закрытой модели. Строки для лога:
+    человек должен понять из них, в чём дело, и куда нажать, не читая кода.
+    reason: "no_token" — токена нет, "bad_token" — токен не принят, "terms" — доступ
+    к модели не получен.
+    """
+    page = f"https://huggingface.co/{repo}"
+    tokens = "https://huggingface.co/settings/tokens"
+    lines = [f"⛔ Hugging Face не даёт скачать модель {repo}: это закрытый (gated) репозиторий."]
+    if reason == "no_token":
+        lines += ["Что сделать:",
+                  f"  1. Войдите на Hugging Face и создайте токен с правом чтения (Read): {tokens}",
+                  "  2. Впишите его в поле HF_TOKEN на вкладке «Настройки» и сохраните.",
+                  f"  3. Откройте страницу модели {page} тем же аккаунтом и примите условия.",
+                  "  4. Запустите деплой снова."]
+    elif reason == "bad_token":
+        lines += ["Hugging Face не принял ваш HF_TOKEN: он удалён, истёк или набран с ошибкой.",
+                  "Что сделать:",
+                  f"  1. Создайте новый токен с правом чтения (Read): {tokens}",
+                  "  2. Замените им HF_TOKEN на вкладке «Настройки».",
+                  f"  3. Убедитесь, что на странице {page} условия приняты этим же аккаунтом.",
+                  "  4. Запустите деплой снова."]
+    else:
+        lines += ["Токен у вас есть, но аккаунт, которому он принадлежит, ещё не получил доступ к этой модели.",
+                  "Что сделать:",
+                  f"  1. Откройте {page}",
+                  "     и войдите в тот аккаунт Hugging Face, чей токен вписан в HF_TOKEN на вкладке «Настройки».",
+                  "  2. Нажмите кнопку принятия условий над списком файлов — «Agree and access repository»"
+                  + (" (или «Request access»)." if mode != "auto" else "."),
+                  ("     Доступ к этой модели одобряет её автор вручную — дождитесь письма от Hugging Face "
+                   "(от минут до нескольких дней)." if mode == "manual"
+                   else "     У этой модели доступ выдаётся сразу после нажатия."),
+                  "  3. Запустите деплой снова — перед арендой программа сама проверит, что доступ появился."]
+    return lines
+
+
+def arch_help(info):
+    """Строки для лога: GGUF сделан под архитектуру, которой нет в llama.cpp."""
+    near = info.get("arch_near") or ""
+    lines = [f"⛔ Файлы {info['repo_id']} записаны с архитектурой «{info.get('arch')}», а llama.cpp "
+             f"такой не знает. Сборку сделали под экспериментальную ветку llama.cpp — обычный "
+             f"llama.cpp на сервере её не откроет («unknown model architecture»).",
+             "Что сделать:",
+             "  1. Возьмите другую GGUF-сборку этой же модели — в подборке программы они проверены.",
+             f"  2. Или найдите её на Hugging Face: https://huggingface.co/models?search="
+             f"{urllib.parse.quote(info['repo_id'].split('/')[-1])}"]
+    if near:
+        lines.append(f"     Подойдёт сборка, у которой в метаданных GGUF (general.architecture) "
+                     f"стоит «{near}» — так эту архитектуру называет llama.cpp.")
+    return lines
+
+
 def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=None,
-             total_gib=None, status_port=None, net_mbps=None, stop=None, report=None):
+             total_gib=None, status_port=None, net_mbps=None, stop=None, report=None,
+             fail_box=None):
     """
     Ждёт готовности модели. Возвращает "ready" / "stalled" / "stalled-engine" / "slow" /
     "failed" (установочный скрипт сам сообщил об ошибке) / "blind" (нет связи с сервером).
@@ -1196,6 +1423,8 @@ def wait_api(url, key, logf=log, timeout=API_TIMEOUT, ssh_host=None, ssh_port=No
                 if info.get("stage") == "failed":
                     logf("⛔ установка на сервере завершилась ошибкой"
                          + (f": {info['fail']}" if info.get("fail") else ""))
+                    if fail_box is not None:
+                        fail_box.append(str(info.get("fail") or ""))
                     return "failed"
             else:
                 # Сервер не ответил на опрос. Это не застой: чаще всего пропала связь с
@@ -1911,7 +2140,10 @@ def deploy(cfg, env=None, logf=log):
     """
     env = env or load_env()
     stop = cfg.get("stop")
-    clore = client(env, stop)
+    provider = provider_of(env, cfg.get("provider"))
+    clore = client(env, stop, provider)
+    # Заказы, оставшиеся в .env, проверяем на ТОЙ площадке, где они взяты
+    prev_provider = provider_of(env)
     api_key = env.get("API_KEY") or ""
     # цены везде в USD; валюта списания выбирается автоматически, если не задана явно
     forced_currency = cfg.get("currency") if cfg.get("currency") in CURRENCIES else None
@@ -1929,10 +2161,27 @@ def deploy(cfg, env=None, logf=log):
             return {"status": "already-running", "api_url": env["API_URL"], "order": env["ORDER"]}
     if not cfg.get("dry_run"):
         check_stop(stop)
-        patient(lambda: _check_leftovers(clore, env, bool(cfg.get("force")), logf), clore, logf, stop)
+        tracked = any(env.get(k) for k in ("ORDER", "RACE_ORDERS", "PENDING_SERVER"))
+        if prev_provider == provider:
+            prev = clore
+        elif tracked and provider_key(env, prev_provider):
+            prev = client(env, stop, prev_provider)
+        else:
+            prev = None      # прежней площадке проверять нечего (или её ключа уже нет)
+        if prev is not None:
+            patient(lambda: _check_leftovers(prev, env, bool(cfg.get("force")), logf), prev, logf, stop)
         fresh = load_env()       # проверка могла убрать из .env ссылки на погашенные заказы
         env = {**env, **{k: fresh.get(k, "") for k in
                          ("ORDER", "SERVER", "API_URL", "SSH", "RACE_ORDERS", "PENDING_SERVER")}}
+        if prev_provider != provider:
+            # В .env один «текущий заказ», и его номер имеет смысл только на своей
+            # площадке. Прежний (если он ещё работает) не трогаем — он остаётся
+            # во вкладке «Заказы» своей площадки, — а .env переключаем на новую
+            if env.get("ORDER"):
+                logf(f"заказ {env['ORDER']} на площадке {PROVIDERS[prev_provider]['title']} "
+                     f"продолжает работать — он виден во вкладке «Заказы» этой площадки")
+            save_env_keys({"PROVIDER": provider, "ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""})
+            env = {**env, "PROVIDER": provider, "ORDER": "", "SERVER": "", "API_URL": "", "SSH": ""}
 
     ref = cfg.get("model") or env.get("MODEL_REPO")
     if not ref:
@@ -1953,20 +2202,47 @@ def deploy(cfg, env=None, logf=log):
             cfg = {**cfg, "gguf_file": None}
     logf(f"{info['repo_id']}: формат {info['format']}, движок {info['engine']}, "
          f"веса {info['weights_gib']} GiB, нужно ~{info['vram_gib']} GiB VRAM, контекст {info['ctx']}")
+    page = f"https://huggingface.co/{info['repo_id']}"
+    if info["engine"] == hfmodels.ENGINE_LLAMACPP and info.get("arch_supported") is False:
+        for line in arch_help(info):
+            logf(line)
+        if not cfg.get("dry_run"):
+            raise SystemExit(f"llama.cpp не знает архитектуру «{info['arch']}» из этой сборки — "
+                             f"модель не запустится ни на одном сервере. Что сделать, написано "
+                             f"в логе выше. Ничего не арендовано")
     if info["gated"] and not env.get("HF_TOKEN"):
         # Раньше это было предупреждение — и деплой шёл по всей очереди: на каждом
         # сервере скачивание падало, а комиссия за создание заказа списывалась
+        for line in hf_access_help(info["repo_id"], "no_token", info.get("gated_mode")):
+            logf(line)
         if not cfg.get("dry_run"):
-            raise SystemExit("репозиторий закрытый (gated), а HF_TOKEN не задан — веса не "
-                             "скачаются ни на одном сервере. Впишите токен на вкладке «Настройки»")
-        logf("⚠️ репозиторий gated, а HF_TOKEN не задан — скачивание упадёт")
+            raise SystemExit(f"модель закрытая, а HF_TOKEN не задан — что сделать, написано "
+                             f"в логе выше. Страница модели: {page}. Ничего не арендовано")
+    if info["gated"] and env.get("HF_TOKEN"):
+        # Токена мало: доступ к закрытой модели выдаётся аккаунту после того, как на её
+        # странице приняли условия. Раньше это выяснялось уже на арендованных серверах —
+        # гонка из трёх машин по $6/ч десять минут повторяла «Access denied»
+        probe = cfg.get("gguf_file") or info.get("gguf_file") or "config.json"
+        ok, why = hfmodels.can_download(info["repo_id"], probe, env["HF_TOKEN"])
+        if ok is False:
+            for line in hf_access_help(info["repo_id"], "bad_token" if why == "HTTP 401" else "terms",
+                                       info.get("gated_mode")):
+                logf(line)
+            if not cfg.get("dry_run"):
+                raise SystemExit(f"нет доступа к закрытой модели на Hugging Face ({why}) — что "
+                                 f"сделать, написано в логе выше. Страница модели: {page}. "
+                                 f"Ничего не арендовано")
+        elif ok is None:
+            logf(f"⚠️ не смог проверить доступ к закрытому репозиторию ({why}) — продолжаю")
+        else:
+            logf("доступ к закрытому репозиторию с вашим HF_TOKEN есть")
 
     # До аренды ничего не оплачивается, поэтому «Стоп» здесь срабатывает сразу
     check_stop(stop)
     rates = patient(clore.currency_rates, clore, logf, stop)
     balances = patient(lambda: wallet_balances(clore), clore, logf, stop)
     bal_usd = sum(amount * rates.get(cur, 0) for cur, amount in balances.items())
-    logf("баланс Clore: " + (", ".join(f"{amount:g} {cur}" for cur, amount in balances.items() if amount)
+    logf(f"баланс {PROVIDERS[provider]['title']}: " + (", ".join(f"{amount:g} {cur}" for cur, amount in balances.items() if amount)
                              or "пусто") + f" (≈ ${bal_usd:.2f})")
 
     # Выгрузка экспертов в оперативку: работает только у llama.cpp и только для MoE.
@@ -1994,6 +2270,7 @@ def deploy(cfg, env=None, logf=log):
         need_ram = max(need_ram, cfg["min_ram"])
     min_net = cfg["min_net"] if cfg.get("min_net") is not None else MIN_NET_DOWN_MBPS
 
+    read_gpu, read_ram = hfmodels.token_read_gib(info["weights_gib"], info.get("moe"), cpu_moe)
     offers = patient(lambda: find_offers(
         clore, need_vram, need_disk, cfg.get("max_price_usd"),
         forced_currency, cfg.get("gpu_filter"), order_type,
@@ -2001,7 +2278,9 @@ def deploy(cfg, env=None, logf=log):
         engine=info["engine"], quant=info.get("precision"),
         allow_old_gpu=bool(cfg.get("allow_old_gpu")),
         balance_usd=bal_usd or None, spread=bool(cfg.get("spread")),
-        need_ram=need_ram, cpu_moe=cpu_moe), clore, logf, stop)
+        need_ram=need_ram, cpu_moe=cpu_moe,
+        read_gpu_gib=read_gpu, read_ram_gib=read_ram,
+        sort=cfg.get("sort") or "value"), clore, logf, stop)
     check_stop(stop)
     picked = picked_servers(cfg)
     if picked:
@@ -2016,6 +2295,17 @@ def deploy(cfg, env=None, logf=log):
             for o in wide:
                 if int(o["id"]) in picked:
                     known.setdefault(int(o["id"]), o)
+            if not all(sid in known for sid in picked) and hasattr(clore, "marketplace"):
+                # Список мог быть из кэша минутной давности, а у некоторых площадок
+                # предложения на секунды пропадают из выдачи и возвращаются. Перед тем
+                # как объявить сервер пропавшим, смотрим один свежий список
+                clore.marketplace(fresh=True)
+                for o in find_offers(clore, 0, 0, None, forced_currency, None, order_type,
+                                     min_net=0, download_gib=info["weights_gib"], limit=10_000,
+                                     engine=info["engine"], quant=info.get("precision"),
+                                     allow_old_gpu=True):
+                    if int(o["id"]) in picked:
+                        known.setdefault(int(o["id"]), o)
         gone = [sid for sid in picked if sid not in known]
         if gone:
             logf("не нашлись в маркетплейсе (заняты или сняты с продажи): "
@@ -2167,6 +2457,8 @@ def deploy(cfg, env=None, logf=log):
                     autossh_entrypoint=True,
                     spot_price=p["amount"] if order_type == "spot" else None,
                     required_price=p["amount"],
+                    # Clore размер диска не спрашивает, другим площадкам он нужен заранее
+                    disk_gb=need_disk,
                 )
                 unsure = False
                 break
@@ -2256,11 +2548,12 @@ def deploy(cfg, env=None, logf=log):
         # качаются полтора часа, и деплой падал по таймауту, уже почти доехав.
         api_timeout = max(API_TIMEOUT, int(offer.get("download_hours", 0) * 3600 * 2.5) + 30 * 60)
         # Сравниваем именно с «ready»: wait_api возвращает непустую строку и при отказе.
+        fail_box = []
         outcome = wait_api(api_url, api_key, lg, timeout=api_timeout,
                            ssh_host=host, ssh_port=ssh_port,
                            total_gib=info.get("weights_gib"),
                            status_port=acc["ports"].get(STATUS_PORT), stop=stp, report=report,
-                           net_mbps=net_est_of(offer))
+                           net_mbps=net_est_of(offer), fail_box=fail_box)
         if outcome == "ready":
             return {"status": "ready", "api_url": api_url, "ssh": ssh}
         if outcome == "slow":
@@ -2271,6 +2564,17 @@ def deploy(cfg, env=None, logf=log):
         tail = remote_tail(host, ssh_port, lines=40 if outcome == "failed" else 12)
         if outcome == "failed":
             # установочный скрипт сам сообщил об ошибке — ждать застоя незачем
+            if any("нет доступа к" in f for f in fail_box):
+                # закрытая модель: на любом другом сервере будет то же самое
+                return {"status": "fail", "reason": "нет доступа к модели", "access_denied": True,
+                        "why": "Hugging Face не даёт скачать закрытую модель"}
+            if any("движок не запустился" in f for f in fail_box):
+                # движок упал при загрузке скачанных весов: дело в модели, а не в сервере
+                if tail:
+                    lg("последние строки логов сервера:\n" + tail)
+                return {"status": "fail", "reason": "движок не запустился", "model_problem": True,
+                        "arch_unknown": any("unknown model architecture" in f for f in fail_box),
+                        "why": "движок не смог загрузить скачанную модель"}
             if tail:
                 lg("последние строки логов сервера:\n" + tail)
             return {"status": "fail", "reason": "ошибка установки", "setup_failed": True,
@@ -2414,6 +2718,13 @@ def deploy(cfg, env=None, logf=log):
         # отмена не прошла — дальше нельзя: второй сервер оплачивался бы вместе с первым
         cancel_or_halt(clore, env, oid, res["reason"] if res.get("blacklist") else None, logf)
         release()
+        if res.get("access_denied"):
+            for line in hf_access_help(info["repo_id"], "terms", info.get("gated_mode")):
+                logf(line)
+            msg = (f"нет доступа к закрытой модели {info['repo_id']} — остальные серверы очереди "
+                   f"не пробую, там было бы то же самое. Что сделать, написано в логе выше")
+            tg(env, "⛔ " + msg)
+            raise SystemExit(msg)
         if res.get("model_problem"):
             msg = (f"⛔ модель скачалась, но движок не запустился на сервере {sid} — похоже, "
                    f"дело в модели или контексте, а не в сервере. Остальные серверы очереди "
@@ -2545,6 +2856,22 @@ def _deploy_race(candidates, plan, rent, bring_up, drop, finish, clore, env, inf
                     if res.get("model_problem"):
                         r["lg"]("движок упал на скачанных весах — похоже, дело в модели; "
                                 "на остальных серверах, скорее всего, будет то же")
+                    if res.get("arch_unknown"):
+                        # llama.cpp не знает архитектуру файла — на других серверах тот же
+                        # llama.cpp, ждать их бессмысленно: гонку заканчиваем сразу
+                        for line in arch_help(info):
+                            logf(line)
+                        done.set()
+                        raise SystemExit("llama.cpp не знает архитектуру этой сборки — все серверы "
+                                         "гонки отменены. Что сделать, написано в логе выше")
+                    if res.get("access_denied"):
+                        # закрытая модель не скачается ни на одном сервере — гонку
+                        # заканчиваем сразу, finally ниже отменит все её заказы
+                        for line in hf_access_help(info["repo_id"], "terms", info.get("gated_mode")):
+                            logf(line)
+                        done.set()
+                        raise SystemExit(f"нет доступа к закрытой модели {info['repo_id']} — все "
+                                         f"серверы гонки отменены. Что сделать, написано в логе выше")
             if winner is not None:
                 break
             if len(finished) == len(racers):
@@ -2661,6 +2988,9 @@ def main():
                   "exclude_hosts": args.exclude_hosts, "race": args.race,
                   "force": args.force, "dry_run": args.dry_run}, env)
     return 0 if res.get("status") in ("ready", "already-running", "dry-run") else 1
+
+
+_load_extensions()
 
 
 if __name__ == "__main__":

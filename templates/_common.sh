@@ -31,7 +31,7 @@ wait_for_entrypoint() {
       echo "[setup] чужой apt завершился, продолжаю"
       break
     }
-    echo "[setup] жду, пока Clore доустановит свои пакеты ($i/60)"
+    echo "[setup] жду, пока площадка доустановит свои пакеты ($i/60)"
     sleep 10
   done
   # отдельно убеждаемся, что sshd успел подняться — иначе сервер будет недоступен
@@ -106,8 +106,14 @@ hf_download() {
     exit 1
   fi
   for i in $(seq 1 40); do
-    if "$cli" download "$@"; then
-      return 0
+    "$cli" download "$@" 2>&1 | tee /root/.hf_last
+    [ "${PIPESTATUS[0]}" -eq 0 ] && return 0
+    # Нет доступа к закрытой модели — повтор не поможет: сразу провал, чтобы деплой
+    # отменил сервер, а не платил за 40 попыток
+    if grep -qiE 'access denied|requires approval|gated repo|401 client error|403 client error|restricted' /root/.hf_last; then
+      echo "ОШИБКА: нет доступа к ${MODEL_REPO} на Hugging Face — откройте https://huggingface.co/${MODEL_REPO} и примите условия тем же аккаунтом, что и HF_TOKEN"         | tee -a /root/deploy.log > /root/.fail
+      stage failed
+      exit 1
     fi
     echo "[setup] скачивание не удалось, попытка $i/40"
     sleep 15

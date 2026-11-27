@@ -22,7 +22,49 @@ const TOP_KINDS = { uncensored: 'uncensored', top: 'top', eco: 'eco' };
 const state = { model: null, offers: [], env: null, polling: null, period: 'uncensored', gguf_file: '',
   // где запускать: 'clore' — аренда сервера, 'pc' — этот компьютер. Запоминаем между сессиями
   // ссылка /#pc открывает сразу режим ПК — удобно для закладки
-  where: (location.hash === '#pc' || localStorage.getItem('where') === 'pc') ? 'pc' : 'clore', pc: null };
+  where: (location.hash === '#pc' || localStorage.getItem('where') === 'pc') ? 'pc' : 'clore', pc: null,
+  // площадка аренды в режиме «сервер»: Clore или подключённая расширением (см. deploy.PROVIDERS)
+  provider: localStorage.getItem('provider') || 'clore', providers: [] };
+
+// Название площадки для текстов: «запрашиваю маркетплейс Clore…»
+const providerTitle = (id = state.provider) => (state.providers.find((p) => p.id === id) || {}).title || 'Clore';
+const withProvider = (path) => path + (path.includes('?') ? '&' : '?') + 'provider=' + encodeURIComponent(state.provider);
+
+// Кнопки площадок рядом с «Сервер Clore». Встроенная одна; остальные появляются, только
+// если на этом компьютере подключены их расширения
+function renderProviders() {
+  const box = $('where');
+  const clore = box.querySelector('button[data-where="clore"]');
+  clore.dataset.provider = 'clore';
+  for (const p of state.providers) {
+    if (p.id === 'clore' || box.querySelector(`button[data-provider="${p.id}"]`)) continue;
+    const b = el('button', '', `☁ Сервер ${esc(p.title)}`);
+    b.dataset.where = 'clore';
+    b.dataset.provider = p.id;
+    b.title = `Арендовать сервер с видеокартой на ${p.title}`;
+    b.onclick = () => { setProvider(p.id); setWhere('clore'); };
+    clore.after(b);
+  }
+  if (!state.providers.some((p) => p.id === state.provider)) setProvider('clore');
+  markWhere();
+}
+
+function markWhere() {
+  document.querySelectorAll('#where button').forEach((b) => b.classList.toggle('on',
+    b.dataset.where === state.where && (!b.dataset.provider || b.dataset.provider === state.provider)));
+}
+
+function setProvider(id) {
+  if (state.provider === id) return;
+  state.provider = id;
+  localStorage.setItem('provider', id);
+  // серверы и цены другой площадки к этой не относятся: очередь и список — заново
+  state.offers = []; state.offersData = null; state.offersSig = null;
+  if ($('offers')) $('offers').innerHTML = '';
+  renderPlan();
+  if (document.querySelector('.tab.active')?.dataset.tab === 'server') autoOffers();
+  if (document.querySelector('.tab.active')?.dataset.tab === 'orders') { loadOrders(); loadWallets(); }
+}
 
 const PERIOD_NOTE = {
   eco: 'Небольшие модели для домашнего ПК, разложенные по объёму видеопамяти: от ноутбука без ' +
@@ -198,6 +240,8 @@ function updateStepNav() {
 async function loadState() {
   const s = await api('/api/state');
   state.env = s;
+  state.providers = s.providers || [];
+  renderProviders();
 
   if (!$('model-ctx').placeholder.includes('по умолчанию')) $('model-ctx').placeholder = `контекст (${s.defaults.ctx})`;
 
@@ -258,7 +302,7 @@ function renderCurrent() {
     return;
   }
   box.innerHTML = raceNote + `<div class="grid">
-    <div class="kv"><b>${esc(c.order)}</b><span>заказ Clore</span></div>
+    <div class="kv"><b>${esc(c.order)}</b><span>заказ ${esc(providerTitle(state.env?.provider))}</span></div>
     <div class="kv"><b>${esc(c.server || '—')}</b><span>сервер</span></div>
     <div class="kv"><b>${c.alive ? 'онлайн' : 'поднимается'}</b><span>состояние API</span></div>
     <div class="kv"><b>${esc(c.engine || '—')}</b><span>движок</span></div>
@@ -500,6 +544,47 @@ function applyQuant(o) {
 const quantSummary = (m) =>
   `${m.weights_gib} ГиБ весов · нужно ≈${m.vram_gib} ГиБ VRAM и ${m.disk_gb} GB диска`;
 
+// Закрытая модель на Hugging Face: скачать её можно только после того, как аккаунт с
+// HF_TOKEN примет условия на странице модели. Говорим об этом сразу при выборе, а не
+// после аренды сервера — со ссылкой и тем, что именно нажать
+function accessNote(m) {
+  const a = m.access;
+  if (!a) return '';
+  const link = `<a href="${esc(a.url)}" target="_blank" rel="noreferrer">${esc(a.url)}</a>`;
+  if (a.ok === true) {
+    return '<p class="muted" style="margin:8px 0 0">🔓 Модель закрытая, но ваш HF_TOKEN уже имеет к ней доступ.</p>';
+  }
+  if (a.ok === null || a.ok === undefined) {
+    return `<p class="muted" style="margin:8px 0 0">Модель закрытая; проверить доступ сейчас не вышло
+      (${esc(a.why || 'нет связи с Hugging Face')}). Перед арендой деплой проверит его ещё раз.</p>`;
+  }
+  const tokens = '<a href="https://huggingface.co/settings/tokens" target="_blank" rel="noreferrer">huggingface.co/settings/tokens</a>';
+  let steps;
+  if (a.reason === 'no_token') {
+    steps = `<li>Создайте токен с правом чтения (Read): ${tokens}</li>
+      <li>Впишите его в поле HF_TOKEN на вкладке «Настройки» и сохраните.</li>
+      <li>Откройте ${link} тем же аккаунтом и примите условия.</li>`;
+  } else if (a.reason === 'bad_token') {
+    steps = `<li>Hugging Face не принял ваш HF_TOKEN — создайте новый (Read): ${tokens}</li>
+      <li>Замените им HF_TOKEN на вкладке «Настройки».</li>
+      <li>Убедитесь, что условия на ${link} приняты этим же аккаунтом.</li>`;
+  } else {
+    steps = `<li>Откройте ${link} и войдите в аккаунт Hugging Face, чей токен вписан в HF_TOKEN.</li>
+      <li>Нажмите над списком файлов «Agree and access repository»${a.mode === 'manual' ? ' (или «Request access»)' : ''}.</li>
+      <li>${a.mode === 'manual'
+        ? 'Доступ к этой модели одобряет её автор вручную — дождитесь письма от Hugging Face.'
+        : 'Доступ выдаётся сразу после нажатия.'}</li>`;
+  }
+  return `<div class="access-warn">
+      <b>⚠ Модель закрытая: без принятия условий на Hugging Face она не скачается — ни на сервер, ни на этот ПК.</b>
+      <ol>${steps}</ol>
+      <button class="ghost" id="btn-access-recheck">Проверить доступ снова</button>
+    </div>`;
+}
+
+// «Проверить доступ снова» — карточка перерисовывается часто, поэтому слушаем на документе
+document.addEventListener('click', (e) => { if (e.target?.id === 'btn-access-recheck') pickModel(); });
+
 function renderModelCard(m) {
   const engines = { tabby: 'TabbyAPI (ExLlamaV3)', llamacpp: 'llama.cpp server', vllm: 'vLLM' };
   $('model-card').innerHTML = `
@@ -508,9 +593,10 @@ function renderModelCard(m) {
       <div class="side">
         <span class="badge ${esc(m.format)}">${esc(m.format)}</span>
         ${m.uncensored ? '<span class="badge">uncensored</span>' : '<span class="badge warn">не похоже на uncensored</span>'}
-        ${m.gated ? '<span class="badge gated">нужен HF-токен</span>' : ''}
+        ${m.gated ? '<span class="badge gated">закрытая модель</span>' : ''}
       </div>
     </div>
+    ${accessNote(m)}
     <div class="grid">
       <div class="kv"><b>${esc(engines[m.engine] || m.engine)}</b><span>движок</span></div>
       <div class="kv"><b id="kv-weights">${m.weights_gib} GiB</b><span>веса (скачать)</span></div>
@@ -529,6 +615,10 @@ function renderModelCard(m) {
       (CUDA-контекст, графы и буфер логитов${m.vocab ? ` — словарь ${fmtK(m.vocab)} токенов` : ''}).
       ${m.kv_known ? 'KV посчитан по конфигу модели' : 'Конфиг модели недоступен — KV прикинут по числу параметров'};
       у llama.cpp кэш в q8_0, у vLLM в fp16. При подборе сервера к этой цифре добавляется 10% запаса.</p>
+    ${m.arch_supported === false ? `<p class="warn-text" style="margin:8px 0 0">⚠ Эта сборка не запустится:
+      файлы записаны с архитектурой «${esc(m.arch)}», а llama.cpp такой не знает — их делали под
+      экспериментальную ветку. Возьмите другую GGUF-сборку этой модели${m.arch_near
+        ? ` (в метаданных GGUF должна стоять архитектура «${esc(m.arch_near)}»)` : ''}.</p>` : ''}
     ${m.ctx_max && m.ctx_max > m.ctx ? `<p class="muted" style="margin:6px 0 0">Модель держит
       ${fmtCtx(m.ctx_max)} контекста, по умолчанию берём ${fmtCtx(m.ctx)}: на полном KV-кэш
       занял бы ${m.ctx ? Math.round(m.kv_gib * m.ctx_max / m.ctx) : '?'} GiB VRAM. Поднять — поле «контекст» выше, пересчитается сразу.</p>` : ''}
@@ -572,9 +662,9 @@ function offerMatches(query, o) {
 // Всё, от чего зависит список серверов. Запоминаем при поиске и сравниваем потом: сменили
 // квант, тип заказа или фильтр — список и цены в нём уже не про то, что будет арендовано.
 function offersSig() {
-  return JSON.stringify([state.model?.repo_id, state.gguf_file, $('order-type').value, $('f-vram').value,
+  return JSON.stringify([state.provider, state.model?.repo_id, state.gguf_file, $('order-type').value, $('f-vram').value,
     $('f-disk').value, $('f-net').value, $('f-ram').value, $('f-price').value.trim(),
-    Boolean($('f-old-gpu')?.checked), cpuMoeOn()]);
+    Boolean($('f-old-gpu')?.checked), cpuMoeOn(), $('f-sort').value]);
 }
 
 // Сколько VRAM нужно модели с текущим квантом и режимом
@@ -702,10 +792,12 @@ function renderOffers() {
         ${o.gpu_note ? `<div class="why ${o.gpu_ok === false ? 'warn-text' : ''}">${esc(o.gpu_note)}</div>` : ''}
       </div>
       <div class="side">
-        ${i === 0 ? '<span class="badge">лучшая цена</span>' : ''}
+        ${i === 0 ? `<span class="badge">${$('f-sort').value === 'value' && o.tps_per_usd ? 'лучшая цена/скорость' : 'лучшая цена'}</span>` : ''}
         ${place >= 0 ? `<span class="badge tier">${place + 1}-й в очереди</span>` : ''}
         ${vramShort(o) ? `<span class="badge gated" title="нужно ≈${needVram()} ГиБ для выбранного кванта">мало VRAM</span>` : ''}
         ${split}
+        <span class="tps" title="Оценка скорости генерации для выбранной модели и кванта: пропускная способность памяти карт / объём весов, читаемых на токен. Сверена с живыми замерами (±10%)">${
+          o.tps_est ? `≈${Math.round(o.tps_est)} ток/с<small>${o.tps_per_usd} за $1/ч</small>` : 'скорость ?'}</span>
         <b>${fmtUsd(o.price_used)}</b>
         <button>${place >= 0 ? 'Убрать' : 'В очередь'}</button>
       </div>`;
@@ -734,6 +826,21 @@ function renderOffers() {
 
 // Выгрузка экспертов в оперативку доступна только у MoE-моделей на llama.cpp.
 // Галочка меняет и требование к карте, и требование к объёму RAM сервера.
+// Сколько ГиБ весов читается на каждый токен: [с карты, из оперативки]. Зеркало
+// hfmodels.token_read_gib — у MoE это общая часть плюс только активные эксперты.
+// Скорость генерации ≈ пропускная способность памяти / этот объём
+function tokenRead() {
+  const m = state.model;
+  if (!m) return [0, 0];
+  const w = Number(m.weights_gib) || 0;
+  const moe = m.moe;
+  if (!moe || !moe.experts || !moe.active) return [w, 0];
+  const share = Number(moe.expert_share) || 0;
+  const experts = w * share * moe.active / moe.experts;
+  const shared = w * (1 - share);
+  return cpuMoeOn() ? [+shared.toFixed(3), +experts.toFixed(3)] : [+(shared + experts).toFixed(3), 0];
+}
+
 function cpuMoeOn() {
   const box = $('f-cpu-moe');
   return Boolean(box && box.checked && state.model?.cpu_moe);
@@ -759,7 +866,7 @@ async function loadOffers() {
   const price = priceValue();
   if (Number.isNaN(price)) return toast('«Цена ≤ $/ч» — число, например 0.5', true);
   const my = nextReq('offers');
-  box.innerHTML = '<p class="muted">запрашиваю маркетплейс Clore… <span id="offers-wait"></span></p>';
+  box.innerHTML = `<p class="muted">запрашиваю маркетплейс ${esc(providerTitle())}… <span id="offers-wait"></span></p>`;
   busy($('btn-offers'), true, 'ищу…');
   // Clore иногда отвечает десятками секунд (лимит запросов, повторы) — показываем,
   // что запрос жив, и не ждём бесконечно
@@ -767,7 +874,7 @@ async function loadOffers() {
   const waitTimer = setInterval(() => {
     const el = $('offers-wait');
     const sec = Math.floor((Date.now() - t0) / 1000);
-    if (el) el.textContent = sec >= 10 ? `${sec} с — Clore отвечает медленно, жду` : '';
+    if (el) el.textContent = sec >= 10 ? `${sec} с — ${providerTitle()} отвечает медленно, жду` : '';
   }, 1000);
   try {
     // Поле «Поиск» сюда не уходит намеренно: берём широкую выборку один раз и дальше
@@ -780,6 +887,9 @@ async function loadOffers() {
       // без модели движок неизвестен — тогда показываем всё, включая старые карты
       engine: state.model?.engine || '', quant: state.model?.precision || '',
       old_gpu: $('f-old-gpu')?.checked ? '1' : '',
+      // по ним сервер оценивает скорость генерации на каждой карте
+      read_gpu: String(tokenRead()[0]), read_ram: String(tokenRead()[1]),
+      sort: $('f-sort').value,
       // С экспертами в оперативке скорость определяет не карта, а пропускная способность
       // RAM, и сортировать предложения надо иначе. Без этого флага список показывал
       // «лучшую цену» на двухканальном десктопе, а деплой брал восьмиканальный EPYC —
@@ -787,6 +897,7 @@ async function loadOffers() {
       cpu_moe: cpuMoeOn() ? '1' : '',
     });
     if (price) q.set('max_price', price);
+    q.set('provider', state.provider);
     const data = await api('/api/offers?' + q, null, OFFERS_TIMEOUT_MS);
     if (!isLatest('offers', my)) return;      // фильтры успели поменять и запросить снова
     state.offersData = data;
@@ -824,7 +935,11 @@ function renderPlan() {
   updateStepNav();       // план меняется вместе с выбором модели и очереди — и готовность этапа
   const m = state.model, queue = state.offers;
   if (!m) { $('plan').innerHTML = '<p class="muted">Шаг 1: выберите модель на вкладке «Модель».</p>'; return; }
-  $('need').innerHTML = `Модель <code>${esc(m.repo_id)}</code>: нужно ≈${m.vram_gib} GiB VRAM и ${m.disk_gb} GB диска, качать ${m.weights_gib} GiB.`;
+  $('need').innerHTML = `Модель <code>${esc(m.repo_id)}</code>: нужно ≈${m.vram_gib} GiB VRAM и ${m.disk_gb} GB диска, качать ${m.weights_gib} GiB.`
+    + (m.access && m.access.ok === false
+      ? `<br><span class="warn-text">⚠ Модель закрытая, доступа у вашего HF_TOKEN нет — деплой остановится до аренды.
+         Примите условия: <a href="${esc(m.access.url)}" target="_blank" rel="noreferrer">${esc(m.access.url)}</a>
+         (подробности — в карточке на вкладке «Модель»).</span>` : '');
   // Очередь показываем целиком: платным окажется только тот сервер, который поднимется,
   // но знать заранее, куда уйдёт деплой после первого отказа, полезно
   const race = $('d-race').checked && queue.length > 1;
@@ -854,10 +969,12 @@ async function startDeploy(dryRun) {
   busy(btn, true, dryRun ? 'проверяю…' : 'запускаю…');
   try {
     await api('/api/deploy', {
+      provider: state.provider,
       model: state.model.repo_id,
       ctx: $('model-ctx').value || state.model.ctx,
       server_ids: state.offers.map((o) => o.id),
       order_type: $('order-type').value,
+      sort: $('f-sort').value,
       max_price: price,
       gpu_filter: $('f-gpu').value.trim(),
       // Остальные фильтры вкладки «Сервер». Раньше автоподбор их не получал: список
@@ -905,8 +1022,16 @@ function pollJob() {
       fails = 0;
       state.jobRunning = j.running;
       renderJobPill(j);
-      $('job-log').textContent = j.log.length ? j.log.join('\n') : '— ещё не запускалось —';
-      $('job-log').scrollTop = $('job-log').scrollHeight;
+      // Ссылки в логе кликабельны: при ошибках туда пишется, куда идти (страница модели,
+      // токены Hugging Face). Текст экранируем, ссылкой делаем только http(s)-адрес
+      const logBox = $('job-log');
+      const logText = j.log.length ? j.log.join('\n') : '— ещё не запускалось —';
+      if (logBox.dataset.raw !== logText) {
+        logBox.dataset.raw = logText;
+        logBox.innerHTML = esc(logText).replace(/https?:\/\/[^\s<>"'«»]*[^\s<>"'«».,;:)]/g,
+          (u) => `<a href="${u}" target="_blank" rel="noreferrer">${u}</a>`);
+      }
+      logBox.scrollTop = logBox.scrollHeight;
       $('job-elapsed').textContent = j.running ? `· идёт ${Math.floor(j.elapsed / 60)} мин ${j.elapsed % 60} с` : '';
       $('btn-deploy').disabled = j.running;
       $('btn-dry').disabled = j.running;
@@ -954,7 +1079,7 @@ async function loadOrders() {
   const box = $('orders');
   box.innerHTML = '<p class="muted">загружаю…</p>';
   try {
-    const { orders } = await api('/api/orders');
+    const { orders } = await api(withProvider('/api/orders'));
     box.innerHTML = '';
     if (!orders.length) { box.innerHTML = '<p class="muted">активных заказов нет</p>'; return; }
     orders.forEach((o) => {
@@ -973,7 +1098,7 @@ async function loadOrders() {
       if (use) use.onclick = async () => {
         if (state.jobRunning) return toast('идёт деплой — переключаться на другой заказ можно после него', true);
         busy(use, true); try {
-          const r = await api('/api/use', { order: o.id });
+          const r = await api('/api/use', { order: o.id, provider: state.provider });
           toast(`переключено на заказ ${o.id}: ${r.model ? r.model.split('/').pop() + ', ' : ''}контекст ${fmtCtx(r.ctx)}`);
           if (r.warning) setTimeout(() => toast(r.warning, true), 4300);
           await loadState();
@@ -990,7 +1115,7 @@ async function loadWallets() {
   const box = $('wallets');
   box.innerHTML = '<p class="muted">загружаю…</p>';
   try {
-    const { wallets, total_usd } = await api('/api/wallets');
+    const { wallets, total_usd } = await api(withProvider('/api/wallets'));
     box.innerHTML = '';
     wallets.forEach((w) => {
       const item = el('div', 'item');
@@ -1018,7 +1143,8 @@ async function cancelOrder(order, btn) {
 Сервер освободится, скачанная модель будет удалена.`)) return;
   busy(btn, true, 'отменяю…');
   try {
-    await api('/api/cancel', { order: id });
+    // заказ из списка — площадки, открытой сейчас; «текущий» — той, где он взят
+    await api('/api/cancel', { order: id, provider: order ? state.provider : state.env?.provider });
     toast(`заказ ${id} отменён`);
     await loadState();
     loadOrders();
@@ -1288,7 +1414,7 @@ function setWhere(w) {
   state.where = w;
   localStorage.setItem('where', w);
   document.body.classList.toggle('mode-pc', w === 'pc');
-  document.querySelectorAll('#where button').forEach((b) => b.classList.toggle('on', b.dataset.where === w));
+  markWhere();
   // открытая вкладка могла исчезнуть вместе с режимом — возвращаемся к выбору модели
   const active = document.querySelector('.tab.active');
   if (active && getComputedStyle(active).display === 'none') document.querySelector('.tab[data-tab="model"]').click();
@@ -1572,6 +1698,8 @@ $('btn-claude-cli').onclick = (e) => claudeTo('cli', 'clore', $('clore-claude'),
 $('btn-claude-desktop').onclick = (e) => claudeTo('desktop', 'clore', $('clore-claude'), e.target);
 $('btn-offers').onclick = loadOffers;
 $('f-cpu-moe').onchange = () => { applyNeed(); loadOffers(); };
+$('f-sort').value = localStorage.getItem('offersSort') === 'price' ? 'price' : 'value';
+$('f-sort').onchange = () => { localStorage.setItem('offersSort', $('f-sort').value); if (state.offersData) loadOffers(); };
 // Фильтр применяется к уже загруженному списку — поэтому мгновенно и без запроса к Clore
 $('f-gpu').oninput = () => { if (state.offersData) renderOffers(); };
 $('f-gpu').onkeydown = (e) => { if (e.key === 'Enter') loadOffers(); };
@@ -1618,7 +1746,9 @@ $('btn-bench').onclick = async () => {
   finally { busy($('btn-bench'), false); }
 };
 
-document.querySelectorAll('#where button').forEach((b) => { b.onclick = () => setWhere(b.dataset.where); });
+document.querySelectorAll('#where button').forEach((b) => {
+  b.onclick = () => { if (b.dataset.where === 'clore') setProvider('clore'); setWhere(b.dataset.where); };
+});
 $('btn-pc-refresh').onclick = () => pcChanged().then(() => toast('железо опрошено заново'));
 $('btn-pc-scan').onclick = scanPc;
 $('local-iso').onchange = () => { localStorage.setItem('iso', $('local-iso').value); loadLocal(); };

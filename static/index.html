@@ -258,6 +258,10 @@
       <label>VRAM ≥ ГиБ<input id="f-vram" type="number" step="1" min="0"></label>
       <label>Диск ≥ ГБ<input id="f-disk" type="number" step="10" min="0"></label>
       <label>Цена ≤ $/ч<input id="f-price" type="text" placeholder="пусто = любая"></label>
+      <label title="Цена/скорость — сколько токенов в секунду даёт каждый доллар в час: свежая карта бывает в разы быстрее старой за те же деньги. Цена ↑ — просто дешевле сначала">Сортировка<select id="f-sort">
+        <option value="value">цена/скорость</option>
+        <option value="price">цена ↑</option>
+      </select></label>
       <label>Поиск<input id="f-gpu" type="text" placeholder="5090 · 2x 4090 · a100 · id 123073"
         title="Слова ищутся в названии карт, их количестве и id сервера — все сразу"></label>
       <label>Сеть ≥ Mbps<input id="f-net" type="number" step="100" min="0" value="200"></label>

@@ -207,6 +207,10 @@ def env_state():
         # сколько секунд ещё не стучимся в Clore после блокировки (0 — всё в порядке).
         # Считается локально, без запроса в сеть
         "clore_blocked": blocked_for(env.get("CLORE_API_KEY")),
+        # площадки аренды: Clore и подключённые из extensions/. ready — ключ задан
+        "providers": [{"id": p["id"], "title": p["title"], "ready": bool(env.get(p["key"]))}
+                      for p in deploy.PROVIDERS.values()],
+        "provider": deploy.provider_of(env),   # где взят текущий заказ
         "current": {
             "order": env.get("ORDER") or "",
             "server": env.get("SERVER") or "",
@@ -252,16 +256,48 @@ def _market_warmer():
     """
     while True:
         try:
-            key = (deploy.load_env().get("CLORE_API_KEY") or "").strip()
+            env = deploy.load_env()
             idle = time.time() - UI_SEEN["t"] > 180
-            if key and not idle and not JOB["running"] and not blocked_for(key):
-                clore = Clore(key)
-                age = clore.market_age()
-                if age is None or age > MARKET_TTL - 30:
-                    clore.marketplace(fresh="if-old")
-        except Exception:   # noqa — подогрев необязателен: не вышло, значит скачаем по кнопке
+            for pid in list(deploy.PROVIDERS):
+                key = deploy.provider_key(env, pid)
+                if not key or idle or JOB["running"] or blocked_for(key):
+                    continue
+                try:
+                    clore = deploy.client(env, provider=pid)
+                    age = clore.market_age()
+                    if age is None or age > MARKET_TTL - 30:
+                        clore.marketplace(fresh="if-old")
+                except Exception:   # noqa — подогрев необязателен: не вышло, скачаем по кнопке
+                    pass
+        except Exception:   # noqa
             pass
         time.sleep(5)
+
+
+def model_access(info, token):
+    """
+    Пустит ли Hugging Face скачать закрытую модель с HF_TOKEN из настроек. Проверяется
+    при каждом выборе модели, без кэша: человек мог только что принять условия на сайте.
+    None — модель открытая, проверять нечего.
+    """
+    if not info.get("gated"):
+        return None
+    out = {"mode": info.get("gated_mode") or "", "url": info.get("url"), "ok": False,
+           "reason": "no_token", "why": ""}
+    if token:
+        probe = info.get("gguf_file") or "config.json"
+        ok, why = hfmodels.can_download(info["repo_id"], probe, token)
+        out.update(ok=ok, why=why,
+                   reason="" if ok else ("bad_token" if why == "HTTP 401" else ("terms" if ok is False else "")))
+    return out
+
+
+def cli(env, src=None, provider=None):
+    """Клиент площадки из запроса UI (поле provider), иначе — площадки текущего заказа."""
+    v = (src or {}).get("provider")
+    if isinstance(v, list):
+        v = v[0] if v else None
+    return deploy.client(env, provider=provider or v or None)
 
 
 def api_get(path, q):
@@ -292,7 +328,8 @@ def api_get(path, q):
         ctx = (q.get("ctx") or [""])[0]
         info = localpc.model_info_cached(ref, ctx=int(ctx) if ctx else None, token=token)
         # оценка «на моём ПК» едет вместе с карточкой: железо опрошено и закешировано
-        return {"model": {**info, "local": localpc.fit(info, localpc.pc(env))}}
+        return {"model": {**info, "local": localpc.fit(info, localpc.pc(env)),
+                          "access": model_access(info, token)}}
 
     if path == "/api/local/pc":
         return {"pc": localpc.pc(env, refresh=(q.get("refresh") or [""])[0] == "1")}
@@ -319,7 +356,7 @@ def api_get(path, q):
         return {"ref": ref, "fit": localpc.fit(info, p)}
 
     if path == "/api/wallets":
-        clore = Clore(env.get("CLORE_API_KEY"))
+        clore = cli(env, q)
         rates = clore.currency_rates()
         out = []
         for w in clore.wallets():
@@ -334,14 +371,17 @@ def api_get(path, q):
         return {"wallets": out, "total_usd": round(sum(w["balance_usd"] or 0 for w in out), 2)}
 
     if path == "/api/orders":
-        clore = Clore(env.get("CLORE_API_KEY"))
+        clore = cli(env, q)
         servers = {int(s.get("id", -1)): s for s in clore.marketplace()}
         rates = clore.currency_rates(list(servers.values()))
         out = []
         for o in clore.my_orders():
             acc = order_access(o)
             sid = int(o.get("si", -1))
-            brief = server_brief(servers[sid], rates) if sid in servers else {}
+            # сервер заказа: из маркетплейса, а у площадок, где арендованный сервер из
+            # него пропадает, — из самого заказа
+            srv = servers.get(sid) or o.get("server")
+            brief = server_brief(srv, rates) if srv else {}
             rate = rates.get(o.get("currency") or "")
             as_usd = lambda v: (round(float(v) * rate, 3) if rate and isinstance(v, (int, float)) else None)  # noqa: E731
             price_day = as_usd(o.get("price"))   # цена заказа у Clore — за сутки
@@ -361,7 +401,7 @@ def api_get(path, q):
         return {"orders": out}
 
     if path == "/api/offers":
-        clore = Clore(env.get("CLORE_API_KEY"))
+        clore = cli(env, q)
         num = lambda k, d=None: (_num(q[k][0], k) if q.get(k) and q[k][0] not in ("", "null") else d)  # noqa: E731
         # Оплата идёт по часам (проверено на живом заказе), поэтому баланс ограничивает
         # не цену сервера, а время его работы. Отдаём баланс как есть, чтобы в карточке
@@ -395,6 +435,8 @@ def api_get(path, q):
             # эксперты в оперативке: меняет не фильтр, а сортировку — сервер с восемью
             # каналами памяти выигрывает у вдвое более дешёвого двухканального
             cpu_moe=cpu_moe,
+            read_gpu_gib=num("read_gpu", 0), read_ram_gib=num("read_ram", 0),
+            sort=(q.get("sort") or ["value"])[0] if (q.get("sort") or [""])[0] in ("value", "price") else "value",
             balance_usd=bal_usd or None,
             hidden=hidden,
             limit=int(num("limit", 30)))}
@@ -554,14 +596,18 @@ def api_post(path, body):
             "cpu_moe": bool(body.get("cpu_moe")),
             # параллельная установка на всех выбранных серверах: остаётся самый быстрый
             "race": bool(body.get("race")),
+            # порядок автоподбора — тот же, что в списке серверов
+            "sort": body.get("sort") if body.get("sort") in ("value", "price") else "value",
             "ssh_password": (body.get("ssh_password") or "").strip() or None,
             "force": bool(body.get("force")),
             "dry_run": bool(body.get("dry_run")),
         }
         if not cfg["model"]:
             raise ValueError("не выбрана модель")
-        if not env.get("CLORE_API_KEY"):
-            raise ValueError("не задан API-ключ Clore.ai (вкладка «Настройки»)")
+        cfg["provider"] = deploy.provider_of(env, body.get("provider") or None)
+        if not deploy.provider_key(env, cfg["provider"]):
+            title = deploy.PROVIDERS[cfg["provider"]]["title"]
+            raise ValueError(f"не задан API-ключ {title} (вкладка «Настройки»)")
         if not env.get("API_KEY"):
             raise ValueError("не задан ключ вашего API (вкладка «Настройки»)")
         with JOB_LOCK:
@@ -596,7 +642,7 @@ def api_post(path, body):
         # cancel_order отвечает ошибкой, и раньше на этом всё заканчивалось: карточка
         # «Текущий сервер» продолжала показывать мёртвый заказ, и убрать её было нечем.
         # Теперь «уже неактивен» считается тем же исходом, что и успешная отмена.
-        err = deploy.cancel_order_safe(Clore(env.get("CLORE_API_KEY")), int(oid),
+        err = deploy.cancel_order_safe(cli(env, body), int(oid),
                                        body.get("issue"), logf=job_log, attempts=2, pause=3)
         if err is not None:
             raise RuntimeError(f"заказ {oid} отменить не удалось — он продолжает "
@@ -632,7 +678,7 @@ def api_post(path, body):
             if JOB["running"]:
                 raise ValueError("идёт деплой — переключаться на другой заказ можно после него")
         oid = int(body["order"])
-        clore = Clore(env.get("CLORE_API_KEY"))
+        clore = cli(env, body)
         order = clore.order(oid)
         if not order:
             raise ValueError(f"заказ {oid} не найден")
@@ -649,7 +695,8 @@ def api_post(path, body):
         repo = m["repo"] or (env.get("MODEL_REPO") if same else "") or ""
         ctx = m["ctx"] or (int(env.get("CTX") or 0) if same else 0) or deploy.DEFAULT_CTX
         engine = m["engine"] or (env.get("ENGINE") if same else "") or ""
-        deploy.save_env_keys({"ORDER": str(oid), "SERVER": str(order.get("si")),
+        deploy.save_env_keys({"PROVIDER": deploy.provider_of(env, body.get("provider") or None),
+                              "ORDER": str(oid), "SERVER": str(order.get("si")),
                               "API_URL": url, "SSH": ssh, "MODEL_REPO": repo,
                               "CTX": str(ctx), "ENGINE": engine})
         deploy.update_opencode(url, key, repo.split("/")[-1] or None, logf=job_log,

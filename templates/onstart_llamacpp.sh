@@ -119,6 +119,20 @@ setsid nohup /root/llama.cpp/build/bin/llama-server \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --temp 0.7 --top-p 0.95 --min-p 0.02 > /root/engine.log 2>&1 < /dev/null &
 set -x
+# Движок, упавший при загрузке модели (неизвестная архитектура, нехватка памяти), раньше
+# выглядел как «загружает веса» ещё 5 минут, пока деплой не замечал застой. Следим, пока
+# он не ответит: умер раньше — сразу провал с причиной из его лога
+( for i in $(seq 1 1440); do
+    curl -fs -o /dev/null "http://127.0.0.1:${PORT}/health" && exit 0
+    if ! pgrep -f /root/llama.cpp/build/bin/llama-server >/dev/null; then
+      sleep 2
+      why=$(grep -a -E ' E |error' /root/engine.log | tail -n 3 | tr '\n' ' ' | cut -c1-260)
+      echo "ОШИБКА: движок не запустился: ${why}" | tee -a /root/deploy.log > /root/.fail
+      stage failed
+      exit 0
+    fi
+    sleep 5
+  done ) &
 # Эксперты читаются из оперативки только после того, как файл окажется в страничном
 # кэше. Иначе первые минуты они подтягиваются с диска, и скорость вдвое ниже рабочей.
 if [ -n "${N_CPU_MOE}" ] && [ "${N_CPU_MOE}" -gt 0 ] 2>/dev/null; then
